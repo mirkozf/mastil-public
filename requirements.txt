@@ -1,0 +1,8 @@
+# Mástil no usa ninguna dependencia externa. Todo es librería estándar de
+# Python 3.11+: json, sqlite3, urllib, zoneinfo, hashlib, zlib, struct.
+#
+# La imagen del código de 4 dígitos se dibuja a mano con zlib y struct en vez
+# de usar Pillow, justamente para que este archivo pueda quedar vacío: una
+# instalación sin dependencias es una instalación que no se rompe sola.
+#
+# Si algún día entra una dependencia, va acá y se explica por qué.

@@ -1,0 +1,52 @@
+# --- secretos ------------------------------------------------------------
+.env
+.env.local
+credentials.json
+token.json
+*.pem
+*.key
+service-account*.json
+client_secret*.json
+
+# --- datos locales -------------------------------------------------------
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+
+# --- evidencia e imágenes generadas en tiempo de ejecución ---------------
+evidence/
+vigia_photos/
+*.png
+
+# --- Python --------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- entornos ------------------------------------------------------------
+venv/
+.venv/
+env/
+ENV/
+
+# --- editores y sistema --------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- respaldos -----------------------------------------------------------
+*.bak
+*.bak-*
+*.orig
