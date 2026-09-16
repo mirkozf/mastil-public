@@ -2,7 +2,7 @@
 import os, sys, dataclasses, json
 from pathlib import Path
 from datetime import datetime
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.update(MASTIL_TELEGRAM_BOT_TOKEN="0:t", MASTIL_OWNER_CHAT_ID="999",
                   MASTIL_ICAL_URL="https://x.invalid/a.ics")
 import config as cm, messages
@@ -96,6 +96,27 @@ r.process(foto(3,"a"))
 ok("Recoge la basura" in " ".join(x["text"] or "" for x in out()), "entrega el bloque")
 ok(sesion()["bloque"].startswith("Recoge"), "y lo guarda")
 
+print("\n=== el pedido de foto no se repite una vez cumplido ===")
+#
+# Paso en produccion: tras entregar el plan, el panel reaparecia al pie del
+# chat con "manda la foto ahora" —la pantalla en la que se habia quedado—,
+# pidiendo justo lo que la foto recien enviada acababa de resolver.
+
+db.execute("UPDATE vigia_session SET stage='trabajando' WHERE id=1")
+r.process(cbq("panel:vigia")); out()
+r.process(cbq("panel:vig:foto")); out()
+panel.recreate_current(YO)
+f = out()[-1]
+texto = f["text"] or ""
+ok(messages.PANEL_VIG_FOTO not in texto,
+   f"el pedido NO se repite al pie del chat ({texto[:40]}...)")
+# Con una tarea viva el panel no vuelve al home: el flujo de Vigia tiene
+# muchos pasos y cada uno te devolvia a la entrada. Vuelve a su MENU, que es
+# distinto de repetir la pantalla anterior.
+ok("VIGÍA" in texto, "vuelve al menu de Vigia, no a la entrada")
+ok("panel:vig:objetivo" in datos(f), "con su botonera de siempre")
+ok(messages.PANEL_VIG_CUANTAS not in texto, "y sin arrastrar la pregunta vieja")
+
 print("\n=== ME TRABÉ desde el submenu ===")
 r.process(cbq("panel:vigia")); out()
 r.process(cbq("/vigia_trabado"))
@@ -114,7 +135,8 @@ ok(sesion()["active"]==1, "VOLVER tampoco cierra")
 r.process(cbq("panel:vig:cancelar")); out()
 r.process(cbq("panel:vig:cancelar:ok"))
 ok(sesion()["active"]==0, "solo CERRAR OBJETIVO cierra")
-ok(any(messages.VIGIA_CANCELADO in (x["text"] or "") for x in out()), "y lo avisa")
+ok(not any(messages.VIGIA_CANCELADO in (x["text"] or "") for x in out()),
+   "y no deja un mensaje histórico")
 
 print("\n=== un comando cancela el formulario del objetivo ===")
 r.process(cbq("panel:vig:objetivo")); out()

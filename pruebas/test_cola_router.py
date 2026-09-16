@@ -3,7 +3,7 @@ import os, sys, dataclasses
 from pathlib import Path
 from datetime import datetime, timedelta
 
-RAIZ = str(Path(__file__).resolve().parent.parent)
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, RAIZ)
 os.environ.update(MASTIL_TELEGRAM_BOT_TOKEN="0:t", MASTIL_OWNER_CHAT_ID="999",
                   MASTIL_ICAL_URL="https://x.invalid/a.ics")

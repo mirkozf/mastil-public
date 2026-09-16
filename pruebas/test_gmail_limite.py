@@ -4,7 +4,7 @@ import os, sys, dataclasses, json
 from pathlib import Path
 from datetime import datetime, timedelta
 
-RAIZ = str(Path(__file__).resolve().parent.parent)
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, RAIZ)
 os.environ.update(MASTIL_TELEGRAM_BOT_TOKEN="0:t", MASTIL_OWNER_CHAT_ID="999",
                   MASTIL_ICAL_URL="https://x.invalid/a.ics")
@@ -16,6 +16,11 @@ import modules.gmail as G
 from database import Database
 from core.router import Router
 from modules.gmail import GmailModule, CONTADOR_KEY
+
+# Esta suite prueba la FRICCION COMPLETA, que hoy no es el modo por
+# defecto (ver FRICCION_COMPLETA en modules/gmail.py). Se declara acá para
+# que siga cubierta pase lo que pase con el interruptor.
+G.FRICCION_COMPLETA = True
 from modules.panel import PanelModule
 
 # ---- reloj falso -------------------------------------------------------
@@ -65,6 +70,9 @@ class TG:
         self.enviados.append(text); return {"ok": True}
 
 class Nada:
+    # Desde `ff1f2cb` el router lo llama en cada mensaje: un doble de
+    # Intervalos tiene que saber contestarlo.
+    def abandon_contexto(self, *a, **k): pass
     def handle_command(self, *a, **k): return False
     def stop(self, *a, **k): pass
     def restore_calendar(self, *a, **k): pass
@@ -111,12 +119,34 @@ def n_hoy(cmd="/gmail_hay"):
     return int((estado.get("usos", {}).get(cmd) or {}).get("n", 0))
 
 
-print("=== 1/2. las dos revisiones del dia ===")
+def revisar(cmd="/gmail_hay", mid=1):
+    """Con cupo, revisar es pedir y confirmar."""
+    r.process(msg(cmd, mid))
+    r.process(cbq("/gmail_igual", mid))
+
+
+print("=== 1/2. las dos revisiones del dia, cada una confirmada ===")
+#
+# Un toque sin querer en el menu no deberia gastar una revision, y ver cuantas
+# quedan deja ver el precio antes de pagarlo.
 r, gmail, puente, vis, tg = montar()
 r.process(msg("/gmail_hay"))
+filas = out()
+texto = " ".join(x["text"] or "" for x in filas)
+ok("Te quedan 2 revisiones hoy" in texto,
+   f"antes de la primera dice que quedan 2 ({texto[:50]})")
+ok("¿hay correos?" in texto, "y nombra cual")
+botones = [b[1] for x in filas if x["buttons"] for g in json.loads(x["buttons"]) for b in g]
+ok(botones == ["/gmail_igual", "/gmail_dejarlo"], f"SI REVISAR / DEJARLO ({botones})")
+ok(not puente.llamadas and n_hoy() == 0, "sin confirmar no consulta ni gasta")
+r.process(cbq("/gmail_igual"))
 ok(any("hilos no leídos" in t for t in textos()), "primera revision responde")
 ok(n_hoy() == 1, f"1/2 ({n_hoy()})")
+ok(not vis.prompts, "sin pasar por el modelo")
 r.process(msg("/gmail_hay"))
+ok(any("Te queda 1 revisión hoy" in t for t in textos()),
+   "antes de la segunda dice que queda 1, en singular")
+r.process(cbq("/gmail_igual"))
 ok(any("hilos no leídos" in t for t in textos()), "segunda revision responde")
 ok(n_hoy() == 2, f"2/2 ({n_hoy()})")
 ok(n_hoy("/gmail_remitentes") == 0, "y remitentes sigue intacto: par propio")
@@ -195,23 +225,24 @@ ok(any(messages.GMAIL_SIN_FRICCION in t for t in textos()), "avisan que no hay n
 print("\n=== 14. dia nuevo, contador en 0 ===")
 avanzar(days=1)
 ok(n_hoy() == 0, f"el contador del dia nuevo arranca en 0 ({n_hoy()})")
-r.process(msg("/gmail_hay"))
-ok(any("hilos no leídos" in t for t in textos()), "revisa sin friccion")
+revisar()
+ok(any("hilos no leídos" in t for t in textos()),
+   "revisa con su confirmacion, sin la friccion del limite")
 ok(n_hoy() == 1, "1/2 del dia nuevo")
 
 print("\n=== el corte es la fecha local, no 24h ===")
 r, gmail, puente, vis, tg = montar()
 RELOJ["t"] = BASE.replace(hour=23, minute=30)
-r.process(msg("/gmail_hay")); r.process(msg("/gmail_hay")); out()
+revisar(); revisar(); out()
 ok(n_hoy() == 2, "dos revisiones a las 23:30")
 RELOJ["t"] = (BASE + timedelta(days=1)).replace(hour=1, minute=0)
 ok(n_hoy() == 0, "a la 01:00 del dia siguiente ya hay cupo, sin esperar 24h")
 
 print("\n=== 15/16. lo que NO se limita ===")
 r, gmail, puente, vis, tg = montar()
-r.process(msg("/gmail_hay")); r.process(msg("/gmail_hay")); out()
+revisar(); revisar(); out()
 ok(n_hoy() == 2, "agotado")
-r.process(msg("/gmail_remitentes")); out()   # para poblar los numeros
+revisar("/gmail_remitentes"); out()   # para poblar los numeros
 llamadas = len(puente.llamadas)
 r.process(msg("/gmail_contenido 1 natural"))
 ok(any("Correo 1" in t for t in textos()), "/gmail_contenido NO se bloquea")
@@ -223,7 +254,7 @@ ok(n_hoy() == 2, "y no cuenta")
 
 print("\n=== 17. si Gemini falla, NO se abre ===")
 r, gmail, puente, vis, tg = montar(vision=VisionFalsa(ok_=False))
-r.process(msg("/gmail_hay")); r.process(msg("/gmail_hay")); out()
+revisar(); revisar(); out()
 llamadas = len(puente.llamadas)
 r.process(msg("/gmail_hay")); out()
 r.process(cbq("/gmail_igual")); out()
@@ -250,7 +281,7 @@ ok("necesito saber si respondio" in gmail.vision.prompts[0], "y reuso el motivo 
 
 print("\n=== 18/19. reinicio y comandos cancelan el formulario ===")
 r, gmail, puente, vis, tg = montar()
-r.process(msg("/gmail_hay")); r.process(msg("/gmail_hay")); out()
+revisar(); revisar(); out()
 llamadas = len(puente.llamadas)
 r.process(msg("/gmail_hay")); out()
 r.process(cbq("/gmail_igual")); out()
@@ -276,6 +307,30 @@ r.process(msg("/gmail_hay", 9, chat=AJENO))
 ok(len(puente.llamadas) == llamadas and n_hoy() == 0, "ni consulta ni cuenta")
 r.process(cbq("/gmail_si", chat=AJENO))
 ok(len(puente.llamadas) == llamadas, "ni por callback")
+
+print("\n=== 2b. con cupo, DEJARLO no gasta nada ===")
+r, gmail, puente, vis, tg = montar()
+r.process(msg("/gmail_remitentes")); out()
+r.process(cbq("/gmail_dejarlo"))
+ok(any(messages.GMAIL_DEJADO in t for t in textos()), "responde y cierra")
+ok(not puente.llamadas and n_hoy("/gmail_remitentes") == 0, "sin consulta ni conteo")
+ok(gmail._friccion is None, "sin estado colgado")
+r.process(cbq("/gmail_igual"))
+ok(not puente.llamadas, "y el SI de esa pregunta ya no revisa")
+
+print("\n=== 2c. el cupo se vuelve a mirar al confirmar ===")
+r, gmail, puente, vis, tg = montar()
+revisar(); out()
+r.process(msg("/gmail_hay")); out()            # pregunta con 1 disponible
+db.set_state(CONTADOR_KEY, {"fecha": ahora().strftime("%Y-%m-%d"),
+                            "usos": {"/gmail_hay": {"n": 2, "ultima": ahora().isoformat()}}})
+llamadas = len(puente.llamadas)
+r.process(cbq("/gmail_igual"))
+ok(any("Ya usaste tus 2 revisiones" in t for t in textos()),
+   "si se agoto entremedio, vuelve la friccion de siempre")
+ok(len(puente.llamadas) == llamadas and n_hoy() == 2, "sin revisar de mas")
+r.process(cbq("/gmail_igual"))
+ok(any(messages.GMAIL_PIDE_MOTIVO in t for t in textos()), "y sigue pidiendo el motivo")
 
 print("\n=== 20. Panel intacto ===")
 r, gmail, puente, vis, tg = montar()

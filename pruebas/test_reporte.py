@@ -4,7 +4,7 @@ import os, sys, dataclasses, zipfile, re
 from pathlib import Path
 from datetime import datetime, timedelta, timezone, date
 
-RAIZ = str(Path(__file__).resolve().parent.parent)
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, RAIZ)
 os.environ.update(MASTIL_TELEGRAM_BOT_TOKEN="0:t", MASTIL_OWNER_CHAT_ID="999",
                   MASTIL_ICAL_URL="https://x.invalid/a.ics")
@@ -197,6 +197,8 @@ class TG:
         return {"ok": True}
 
 class Nada:
+    # Desde `ff1f2cb` el router lo llama en cada mensaje.
+    def abandon_contexto(self, *a, **k): pass
     def handle_command(self, *a, **k): return False
     def stop(self, *a, **k): pass
     def restore_calendar(self, *a, **k): pass
@@ -235,7 +237,8 @@ r, panel, tg = montar()
 r.process(cbq("panel:intervalos"))
 f = out()[-1]
 ok("panel:int:reporte" in datos_de(f), f"REPORTE esta en el menu ({datos_de(f)})")
-ok(datos_de(f) == ["/marca", "/tiempo", "panel:int:reset", "panel:int:reporte", "panel:home"],
+ok(datos_de(f) == ["/marca", "/marca_contexto", "/tiempo",
+                   "panel:int:reset", "panel:int:reporte", "panel:home"],
    "y no se agrego ningun otro boton")
 
 r.process(cbq("panel:int:reporte"))
@@ -288,7 +291,9 @@ ok(not panel._pendientes and not panel._reportes, "y descarta formulario y rango
 
 print("\n=== 14/15. Panel e Intervalos intactos ===")
 from modules.intervalos import MOMENTOS_AVISO, ESPERA_MINUTOS, HORAS_CIERRE, MAX_FILAS
-ok(MOMENTOS_AVISO == (0, 150, 180, 420) and ESPERA_MINUTOS == 76, "constantes de Intervalos")
+ok(MOMENTOS_AVISO == (0, 150, 180, 420), "constantes de Intervalos")
+ok(isinstance(ESPERA_MINUTOS, int) and ESPERA_MINUTOS > 0,
+   f"ESPERA_MINUTOS lo fija el usuario a mano: {ESPERA_MINUTOS} min")
 ok(HORAS_CIERRE == 4 and MAX_FILAS == 10, "y las otras dos")
 ok(messages.INTERVALOS_AVISO == "⏱ Intervalo cumplido.", "su aviso")
 ok(messages.INTERVALOS_TITULO == "📊 MARCAS DEL CICLO", "su titulo")

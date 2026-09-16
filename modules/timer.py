@@ -44,6 +44,18 @@ FIXED = "fixed"
 REPEATING = "repeating"
 
 
+def _segundos_de(token: str):
+    """`4:20` -> 260 segundos. Un numero suelto NO es esto: son minutos.
+
+    Existe porque a veces lo que se necesita no cae en minutos enteros, y
+    escribir `4:20` es mas directo que calcular cuantos minutos son.
+    """
+    match = re.fullmatch(r"(\d{1,4}):([0-5]?\d)", token or "")
+    if not match:
+        return None
+    return int(match.group(1)) * 60 + int(match.group(2))
+
+
 class TimerModule:
     def __init__(self, config, db):
         self.config = config
@@ -294,6 +306,16 @@ class TimerModule:
 
     def start(self, raw_text: str) -> bool:
         parts = raw_text.strip().split()
+
+        # El primer valor puede venir como M:SS. Se convierte acá y el
+        # resto del parseo sigue igual: los avisos son minutos enteros,
+        # como siempre.
+        segundos = _segundos_de(parts[1]) if len(parts) > 1 else None
+        if segundos is not None:
+            # Hacia arriba: un timer de 4:20 dura mas de 4 minutos, y
+            # `duration_minutes` es el techo con el que se validan los
+            # avisos. El fin exacto lo marca `ends_at`, no esta columna.
+            parts = [parts[0], str(-(-segundos // 60))] + parts[2:]
         if len(parts) < 2:
             with self.db.transaction():
                 self._say(messages.TIMER_USO, buttons=[("⏱ /tm", "/tm")])
@@ -337,10 +359,12 @@ class TimerModule:
             return True
 
         now = now_local().replace(microsecond=0)
-        ends = now + __import__("datetime").timedelta(minutes=total)
+        if segundos is None:
+            segundos = total * 60
+        ends = now + __import__("datetime").timedelta(seconds=segundos)
         razon = messages.timer_razon(reason)
         detalle = (
-            f"{total} minutos.\n"
+            f"{messages.timer_duracion(segundos)}\n"
             f"{razon + chr(10) if razon else ''}"
             f"Termina a las {clock(ends)}."
         )
@@ -630,8 +654,13 @@ class TimerModule:
 
     def _alarm(self, timer) -> None:
         razon = messages.timer_razon(timer["reason"])
+        inicio = from_iso(timer["started_at"])
+        fin = from_iso(timer["ends_at"])
+        # Pausar y reanudar corre el inicio y el fin juntos, así que su
+        # diferencia es siempre la duración pedida, exacta, también un 4:20.
+        segundos = int((fin - inicio).total_seconds()) if inicio and fin else 0
         self._say(
-            "⏰ Timer terminado.\n"
+            f"{messages.timer_terminado(segundos)}\n"
             f"{razon + chr(10) if razon else ''}"
             "Usa /apagar para detener.\n"
             "Si no lo apagas, se apagará solo tras 6 minutos.",

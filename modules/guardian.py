@@ -16,6 +16,7 @@ Cada evento conserva su fila y su fase. `is_active` marca cuál está en curso.
 from __future__ import annotations
 
 import hashlib
+import json
 import random
 import re
 from datetime import timedelta
@@ -88,8 +89,13 @@ FASES_CON_DESTINO = ("done", "discarded", "queued", "decision")
 DECISION_CADENCIA = (3, 8, 15, 30, 45, 60)
 DECISION_LUEGO = 15
 
-# Un solo aviso agregado mientras hay un evento activo, sin importar cuántos
-# haya en cola. Uno por evento sería exactamente el ruido que esto evita.
+# Cada cuánto la tarjeta de la cola se vuelve a mandar abajo y suena: mientras
+# hay un evento activo con cosas esperando, y mientras una decisión sigue sin
+# respuesta. Editarla en su sitio no avisa ni la mueve, y así una decisión pudo
+# quedar muda arriba mientras toda la fila se detenía detrás.
+#
+# Sigue siendo un solo aviso agregado —la tarjeta lista todo lo que espera—,
+# nunca uno por evento, que sería exactamente el ruido que la cola vino a evitar.
 COLA_AVISO_MINUTOS = 15
 
 # Cuánto espera un evento al que se le dijo DESPUÉS antes de volver a ofrecerse.
@@ -97,6 +103,8 @@ DESPUES_MINUTOS = 15
 
 COLA_AVISO_KEY = "cola_aviso_next"
 COLA_HUBO_KEY = "cola_hubo"
+COLA_ANCLA_MESSAGE_KEY = "guardian_queue_message_id"
+COLA_ANCLA_OUTBOX_KEY = "guardian_queue_outbox_id"
 
 
 def _offset_decision(numero: int) -> int:
@@ -139,9 +147,10 @@ def _sin_repetir(anterior: str | None) -> str:
 
 
 class GuardianModule:
-    def __init__(self, config, db):
+    def __init__(self, config, db, message_policy=None):
         self.config = config
         self.db = db
+        self.message_policy = message_policy
 
     # ---------------------------------------------------------------- datos
 
@@ -161,12 +170,158 @@ class GuardianModule:
         )
 
     def _say(self, text: str, buttons=None, send_after=None,
-             parse_mode: str | None = None) -> None:
+             retain_message: bool = False,
+             parse_mode: str | None = None,
+             evento: str | None = None) -> None:
+        """Un mensaje del Guardian, atado al flujo del evento del que habla.
+
+        `evento` existe para los avisos que se emiten JUSTO DESPUÉS de sacar el
+        evento de escena. Ahí ya no hay activo, así que el mensaje saldría sin
+        flujo, y sin flujo la ventana de tres lo trata como charla suelta y se
+        lo lleva aunque el asunto siga abierto.
+        """
+        if evento is None:
+            active = self._active()
+            evento = active["event_id"] if active else None
+        flow_key = self._flow_key(evento) if evento else None
         self.db.enqueue(self.config.owner_chat_id, text, buttons=buttons,
-                        send_after=send_after, parse_mode=parse_mode)
+                        send_after=send_after, parse_mode=parse_mode,
+                        retain_message=retain_message,
+                        flow_key=flow_key)
+
+    @staticmethod
+    def _flow_key(event_id: str) -> str:
+        return f"guardian:{event_id}"
+
+    def _close_message_flow(self, event_id: str) -> None:
+        if self.message_policy:
+            self.message_policy.close_flow(self._flow_key(event_id))
 
     def _label(self, title: str) -> str:
         return messages.task_label(title, self.config.prefix)
+
+    def _queue_title(self, title: str) -> str:
+        raw = str(title or "").strip()
+        if raw.startswith(self.config.prefix):
+            raw = raw[len(self.config.prefix):].strip()
+        return raw or "Sin nombre"
+
+    def _queue_head(self):
+        return self.db.one(
+            """
+            SELECT rowid AS rid, * FROM guardian_events
+            WHERE phase = 'queued'
+            ORDER BY queue_seq ASC, start_at ASC
+            LIMIT 1
+            """
+        )
+
+    def _queue_anchor(self, text: str, buttons=None) -> None:
+        """Crea o edita la unica tarjeta de estado de la cola."""
+        message_id = self.db.get_state(COLA_ANCLA_MESSAGE_KEY)
+        pending_id = self.db.get_state(COLA_ANCLA_OUTBOX_KEY)
+        encoded_buttons = (
+            json.dumps(list(buttons), ensure_ascii=False) if buttons else None
+        )
+
+        if pending_id:
+            updated = self.db.execute(
+                """
+                UPDATE outbox
+                SET text = ?, buttons = ?, parse_mode = ?, retain_message = 1
+                WHERE id = ? AND sent_at IS NULL
+                """,
+                (text, encoded_buttons, "HTML", int(pending_id)),
+            )
+            if updated.rowcount:
+                return
+            self.db.set_state(COLA_ANCLA_OUTBOX_KEY, None)
+
+        if message_id:
+            self.db.enqueue(
+                self.config.owner_chat_id, text, buttons=buttons,
+                parse_mode="HTML", message_id=int(message_id),
+                retain_message=True,
+            )
+            return
+
+        outbox_id = self.db.enqueue(
+            self.config.owner_chat_id, text, buttons=buttons,
+            parse_mode="HTML", retain_message=True,
+        )
+        self.db.set_state(COLA_ANCLA_OUTBOX_KEY, outbox_id)
+
+    def _clear_queue_anchor(self) -> None:
+        """Retira la tarjeta cuando ya no representa nada pendiente."""
+        pending_id = self.db.get_state(COLA_ANCLA_OUTBOX_KEY)
+        if pending_id:
+            self.db.execute(
+                "DELETE FROM outbox WHERE id = ? AND sent_at IS NULL",
+                (int(pending_id),),
+            )
+            self.db.set_state(COLA_ANCLA_OUTBOX_KEY, None)
+
+        message_id = self.db.get_state(COLA_ANCLA_MESSAGE_KEY)
+        if message_id:
+            self.db.enqueue_delete(self.config.owner_chat_id, int(message_id))
+            self.db.set_state(COLA_ANCLA_MESSAGE_KEY, None)
+
+    def _titulos_en_cola(self) -> list:
+        """Lo que espera en la fila, en el orden en que se va a ofrecer."""
+        return [
+            self._queue_title(fila["title"])
+            for fila in self.db.query(
+                "SELECT title FROM guardian_events WHERE phase = 'queued' "
+                "ORDER BY queue_seq ASC, start_at ASC"
+            )
+        ]
+
+    def _reenviar_tarjeta(self) -> None:
+        """Vuelve a mandar la tarjeta abajo, para que suene.
+
+        Se borra la anterior antes de mandar la nueva: nunca queda más de una.
+        """
+        with self.db.transaction():
+            self._clear_queue_anchor()
+            self._sync_queue_anchor(force=True)
+
+    def _sync_queue_anchor(self, force: bool = False) -> None:
+        """Mantiene una sola tarjeta: cola pasiva o decisión activa."""
+        decision = self._en_decision()
+        active = self._active()
+        head = self._queue_head()
+
+        if decision:
+            text = messages.cola_decision(
+                self._queue_title(decision["title"]),
+                clock(from_iso(decision["start_at"])),
+                self._titulos_en_cola(),
+            )
+            buttons = messages.cola_botones(decision["rid"])
+        elif active and head:
+            text = messages.cola_ancla(self._titulos_en_cola())
+            buttons = None
+        else:
+            self._clear_queue_anchor()
+            return
+
+        if not force and (
+            self.db.get_state(COLA_ANCLA_MESSAGE_KEY)
+            or self.db.get_state(COLA_ANCLA_OUTBOX_KEY)
+        ):
+            return
+        self._queue_anchor(text, buttons)
+
+    def adopt_queue_anchor_message_id(self, outbox_id: int, response) -> None:
+        """El runtime entrega el id real cuando Telegram aceptó la tarjeta."""
+        if self.db.get_state(COLA_ANCLA_OUTBOX_KEY) != outbox_id:
+            return
+        message_id = ((response or {}).get("result") or {}).get("message_id")
+        if message_id is None:
+            return
+        with self.db.transaction():
+            self.db.set_state(COLA_ANCLA_MESSAGE_KEY, int(message_id))
+            self.db.set_state(COLA_ANCLA_OUTBOX_KEY, None)
 
     # ------------------------------------------------------------- selección
 
@@ -269,8 +424,7 @@ class GuardianModule:
                     (event_id, title, start_at, seq, ahora, ahora),
                 )
             self.db.set_state(COLA_HUBO_KEY, True)
-            self._say(messages.cola_encolado(title, self._pendientes()),
-                      parse_mode="HTML")
+            self._sync_queue_anchor(force=True)
             self.db.audit("guardian", "cola_encolado", title)
 
     def _activar(self, fila) -> None:
@@ -288,6 +442,7 @@ class GuardianModule:
                 tregua_hasta=None, tregua_code_hash=None,
                 tregua_code_hasta=None,
             )
+            self._clear_queue_anchor()
             self.db.audit("guardian", "cola_activado", fila["title"])
 
     def _presentar(self, fila) -> None:
@@ -300,25 +455,20 @@ class GuardianModule:
                 decision_next_at=iso(ahora + timedelta(minutes=_offset_decision(1))),
             )
             self.db.audit("guardian", "cola_decision", fila["title"])
-        self._decir_decision(fila["event_id"])
+        # Le tocó el turno: es el momento en que hay que decidir, así que la
+        # tarjeta llega como mensaje nuevo y suena.
+        self._decir_decision(fila["event_id"], reenviar=True)
 
-    def _decir_decision(self, event_id: str, message_id: int | None = None) -> None:
-        fila = self.db.one(
-            "SELECT rowid AS rid, * FROM guardian_events WHERE event_id = ?",
-            (event_id,),
-        )
-        if not fila:
-            return
+    def _decir_decision(self, event_id: str, message_id: int | None = None,
+                        reenviar: bool = False) -> None:
         with self.db.transaction():
-            self.db.enqueue(
-                self.config.owner_chat_id,
-                messages.cola_decision(
-                    fila["title"], clock(from_iso(fila["start_at"]))
-                ),
-                buttons=messages.cola_botones(fila["rid"]),
-                parse_mode="HTML",
-                message_id=message_id,
-            )
+            # `message_id` pertenece a recordatorios antiguos de la versión
+            # previa. La tarjeta central es la única; con `reenviar` se manda
+            # de nuevo abajo y suena, sin eso sólo se actualiza en su sitio.
+            if reenviar:
+                self._reenviar_tarjeta()
+            else:
+                self._sync_queue_anchor(force=True)
 
     def _promover(self) -> None:
         """Canal libre: se ofrece el primero de la fila. Nunca se auto-activa."""
@@ -345,6 +495,7 @@ class GuardianModule:
             with self.db.transaction():
                 self.db.set_state(COLA_HUBO_KEY, False)
                 self.db.set_state(COLA_AVISO_KEY, None)
+                self._clear_queue_anchor()
                 self._say(messages.COLA_LIBRE)
 
     def _recordatorios(self) -> None:
@@ -352,7 +503,7 @@ class GuardianModule:
         activo = self._active()
         pendientes = self._pendientes()
 
-        # a) Hay un activo y hay cola: presencia suave y agregada.
+        # a) Hay un activo y hay cola: la tarjeta visible ya es esa presencia.
         if activo and pendientes:
             proximo = self.db.get_state(COLA_AVISO_KEY)
             if not proximo:
@@ -367,7 +518,8 @@ class GuardianModule:
                         COLA_AVISO_KEY,
                         iso(now_local() + timedelta(minutes=COLA_AVISO_MINUTOS)),
                     )
-                    self._say(messages.cola_pendientes(pendientes), parse_mode="HTML")
+                    # La tarjeta vuelve a bajar y suena con la lista al día.
+                    self._reenviar_tarjeta()
         elif self.db.get_state(COLA_AVISO_KEY):
             with self.db.transaction():
                 self.db.set_state(COLA_AVISO_KEY, None)
@@ -384,7 +536,12 @@ class GuardianModule:
                         base + timedelta(minutes=_offset_decision(paso + 1))
                     ),
                 )
-            self._decir_decision(fila["event_id"])
+            # Suena en los múltiplos de COLA_AVISO_MINUTOS (15, 30, 45...).
+            # Los recordatorios de 3 y 8 minutos sólo refrescan la tarjeta.
+            self._decir_decision(
+                fila["event_id"],
+                reenviar=_offset_decision(paso) % COLA_AVISO_MINUTOS == 0,
+            )
 
     # ------------------------------------------------------------------ tick
 
@@ -393,6 +550,7 @@ class GuardianModule:
         # Antes de mirar el activo, la fila: así el evento que se acaba de
         # activar entra a su flujo en este mismo tick, no en el siguiente.
         self._promover()
+        self._sync_queue_anchor()
         self._recordatorios()
 
         state = self._active()
@@ -487,11 +645,17 @@ class GuardianModule:
                     self.config.owner_chat_id, messages.GUARDIAN_CODIGO,
                     photo_path=str(imagen), delete_photo=True,
                     send_after=ahora + timedelta(seconds=PAUSA_ORIENTACION),
+                    # La imagen es parte del nivel 2: no cae por la
+                    # ventana mientras se espera el codigo, y se va con el
+                    # resto del flujo cuando el evento se cierra.
+                    retain_message=True,
+                    flow_key=self._flow_key(state["event_id"]),
                 )
             except Exception as exc:
                 print(f"[guardian] no pude generar la imagen: {exc}", flush=True)
                 self._say(f"{messages.GUARDIAN_CODIGO}\n\nNúmero: {codigo}",
-                          send_after=ahora + timedelta(seconds=PAUSA_ORIENTACION))
+                          send_after=ahora + timedelta(seconds=PAUSA_ORIENTACION),
+                          retain_message=True)
             self.db.audit("guardian", "nivel_2")
 
     # --------------------------------------------------------- nivel 3
@@ -560,10 +724,12 @@ class GuardianModule:
         Sin esto, empezar una tregua dejaría cayendo los que ya estaban en la
         cola con `send_after`, y el silencio prometido no sería silencio.
         """
-        marcas = ",".join("?" * len(messages.GUARDIAN_INSISTE))
+        state = self._active()
+        if not state:
+            return
         self.db.execute(
-            f"DELETE FROM outbox WHERE sent_at IS NULL AND text IN ({marcas})",
-            messages.GUARDIAN_INSISTE,
+            "DELETE FROM outbox WHERE sent_at IS NULL AND flow_key = ?",
+            (self._flow_key(state["event_id"]),),
         )
 
     # ----------------------------------------------------- tregua de 11 min
@@ -604,6 +770,7 @@ class GuardianModule:
                 self.db.enqueue(
                     self.config.owner_chat_id, texto,
                     photo_path=str(imagen), delete_photo=True,
+                    flow_key=self._flow_key(state["event_id"]),
                 )
             except Exception as exc:
                 # Si el dibujo falla, la tregua se ofrece igual: dejarte sin
@@ -666,7 +833,7 @@ class GuardianModule:
             for indice in range(RAFAGA_MENSAJES):
                 # El segundo lleva el nombre del evento: para entonces la
                 # pantalla ya está mirada y la pregunta es cuál era la tarea.
-                if indice == 1:
+                if indice in (1, RAFAGA_MENSAJES - 1):
                     texto = messages.guardian_insiste_tarea(
                         self._label(state["title"])
                     )
@@ -757,7 +924,11 @@ class GuardianModule:
             # Corta la ráfaga en curso: los mensajes que quedaban programados
             # ya no tienen sentido y llegarían después del /listo.
             self._cortar_rafaga()
-            self._say(random.choice(messages.MENSAJES_CIERRE))
+            self._close_message_flow(state["event_id"])
+            self._say(
+                messages.guardian_cerrado(self._label(state["title"]))
+                + "\n\n" + random.choice(messages.MENSAJES_CIERRE)
+            )
             self.db.audit("guardian", "done")
 
     # ------------------------------------------------------------ comandos
@@ -864,7 +1035,16 @@ class GuardianModule:
                     now_local() + timedelta(minutes=DESPUES_MINUTOS)
                 ),
             )
-            self._say(messages.cola_despues(fila["title"]), parse_mode="HTML")
+            self._clear_queue_anchor()
+            # Aplazar dos veces el mismo evento no debe dejar dos avisos
+            # idénticos: el anterior no dice nada que el nuevo no diga, y como
+            # ahora se quedan en pantalla, se irían apilando.
+            self._close_message_flow(fila["event_id"])
+            # Atado al evento que vuelve a la cola: el asunto no se resolvió,
+            # sólo se aplazó. El aviso se queda hasta que ese evento se cierre
+            # de verdad, igual que los mensajes de una ráfaga.
+            self._say(messages.cola_despues(fila["title"]), parse_mode="HTML",
+                      evento=fila["event_id"])
             self.db.audit("guardian", "cola_despues", fila["title"])
 
     def _descartar(self, fila) -> None:
@@ -875,6 +1055,7 @@ class GuardianModule:
                 queue_seq=None, decision_at=None, decision_step=0,
                 decision_next_at=None, next_at=None, code_hash=None,
             )
+            self._clear_queue_anchor()
             self._say(messages.cola_descartado(fila["title"]), parse_mode="HTML")
             self.db.audit("guardian", "cola_descartado", fila["title"])
 
@@ -885,15 +1066,25 @@ class GuardianModule:
         if not state:
             return False
         with self.db.transaction():
+            self._close_message_flow(state["event_id"])
             self._update(state["event_id"], phase="done", is_active=0,
                          minutos_en_rescate=0, rescue_started_at=None)
         return True
 
     def reset(self) -> None:
+        event_ids = [
+            row["event_id"]
+            for row in self.db.query(
+                "SELECT event_id FROM guardian_events WHERE phase != 'done'"
+            )
+        ]
+        for event_id in event_ids:
+            self._close_message_flow(event_id)
         self.db.execute("DELETE FROM guardian_events")
         # Sin eventos no hay cola: sus dos marcas quedarían mintiendo.
         self.db.set_state(COLA_AVISO_KEY, None)
         self.db.set_state(COLA_HUBO_KEY, False)
+        self._clear_queue_anchor()
 
     def cleanup_old_events(self) -> None:
         cutoff = iso(now_local() - timedelta(days=2))

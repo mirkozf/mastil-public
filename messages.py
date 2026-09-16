@@ -26,7 +26,8 @@ CALENDAR_USAGE = (
     "Hoy: <code>/cal **ir a comer 18:30</code>\n"
     "Mañana: <code>/cal **ir a comer next 19:30</code>\n"
     "Otra fecha: <code>/cal barrer 12/11 20:00</code>\n\n"
-    "La hora siempre usa formato de 24 horas y cada evento dura 30 minutos."
+    "La hora va en reloj de 12: agrega <code>a</code> o <code>p</code> al final,\n"
+    "o te pregunto. Cada evento dura 30 minutos."
 )
 
 CALENDAR_ERROR_TITLE = (
@@ -35,8 +36,18 @@ CALENDAR_ERROR_TITLE = (
 )
 
 CALENDAR_ERROR_TIME = (
-    "La hora debe ir al final y usar cuatro dígitos en formato 24 horas.\n\n"
-    "Ejemplo: <code>/cal **ir a comer 18:30</code>"
+    "No entendí la hora. Va al final, en reloj de 12.\n\n"
+    "Ejemplos: <code>9:30 a</code> · <code>1:30 p</code> · <code>21:30</code>"
+)
+
+CALENDAR_ERROR_AMPM = (
+    "Falta saber si es AM o PM.\n\n"
+    "Agrega <code>a</code> o <code>p</code> al final: "
+    "<code>9:30 a</code>, <code>1:30 p</code>."
+)
+
+CALENDAR_ERROR_MEDIANOCHE = (
+    "Las 00 no se usan. La medianoche se escribe <code>12 a</code>."
 )
 
 CALENDAR_ERROR_DATE_FORMAT = (
@@ -48,9 +59,12 @@ CALENDAR_UNAVAILABLE = (
     "Calendar no está conectado en esta instalación. No se creó ningún evento."
 )
 
+# Sólo después de releer el día y no encontrarlo. Antes salía apenas fallaba
+# la respuesta del puente, diciendo "No se creó nada", y casi siempre sí se
+# había creado.
 CALENDAR_CREATE_FAILED = (
-    "No pude crear el evento en Google Calendar. No se creó nada. "
-    "Revisa que el puente de Calendar esté disponible e inténtalo de nuevo."
+    "No pude crear el evento: lo busqué en Google Calendar y no está. "
+    "Inténtalo de nuevo."
 )
 
 CALENDAR_ALREADY_CREATED = (
@@ -275,11 +289,20 @@ POMODORO_CORTE = (
 )
 
 
-def pomodoro_iniciado(label: str, cycle: int, ciclos: int, minutos: int) -> str:
-    return (
+def pomodoro_sugerencia(minutos: int) -> str:
+    """Una sugerencia, no una orden. Ver la tabla en `modules/pomodoro.py`."""
+    return f"🧘 Descanso recomendado: {minutos} min"
+
+
+def pomodoro_iniciado(label: str, cycle: int, ciclos: int, minutos: int,
+                      descanso: int | None = None) -> str:
+    base = (
         f"Pomodoro iniciado: {label}\n"
         f"Bloque {cycle} de {ciclos}. Trabajo silencioso por {minutos} minutos."
     )
+    if descanso is None:
+        return base
+    return f"{base}\n\n{pomodoro_sugerencia(descanso)}"
 
 
 def pomodoro_descanso(label: str, kind: str) -> str:
@@ -535,10 +558,36 @@ ESTADO_SUSPENDIDO = (
     "Estado de ⛵ Mástil: SUSPENDIDO. Usa /reanudar para volver a activar vigilancia."
 )
 
+# --- suspension exclusiva de Guardian ------------------------------------
+#
+# Apaga sólo Guardian. Los eventos NO se tocan: no se borran, no se resuelven,
+# no cambian de hora. Silenciar no es resolver.
+#
+# Los textos describen sólo el comportamiento del sistema. Nada sobre por qué
+# lo suspendiste.
+
+BOTON_SUSPENDER_GUARDIAN = [("⏸️ SUSPENDER GUARDIAN", "/suspender_guardian")]
+BOTON_REANUDAR_GUARDIAN = [("▶️ REANUDAR GUARDIAN", "/reanudar_guardian")]
+
+GUARDIAN_SUSPENDIDO_AVISO = (
+    "⏸️ Guardian suspendido.\n\n"
+    "La agenda sigue funcionando normalmente.\n"
+    "Guardian no enviará intervenciones mientras esté suspendido."
+)
+
+GUARDIAN_REANUDADO_AVISO = (
+    "▶️ Guardian reanudado.\n\n"
+    "Vuelve a procesar los eventos según sus reglas normales."
+)
+
+GUARDIAN_ESTADO_ACTIVO = "🔴 Guardian activo."
+GUARDIAN_ESTADO_SUSPENDIDO = "⏸️ Guardian suspendido."
+
+
 ESTADO_RESETEADO = "Estado interno reseteado. ⛵ Mástil queda limpio."
 
 # --- sorpresa ------------------------------------------------------------
-# Un mensaje puntual que el propietario le manda a su madre por Telegram.
+# Un mensaje puntual que el propietario le manda a la usuaria asistida por Telegram.
 # No hay plantillas, ni programación, ni respuesta esperada: escribe y llega.
 
 SORPRESA_USO = "Uso: /sorpresa &lt;mensaje&gt;"
@@ -561,6 +610,15 @@ def sorpresa(texto: str) -> str:
     return f"⚓✨ Sorpresa de Mástil\n\n{texto}"
 
 
+def guardian_cerrado(tarea: str) -> str:
+    """Lo primero que se lee al cerrar: QUE se cerro.
+
+    La medalla viene despues. Sin esta linea, diez minutos mas tarde el
+    chat no dice que quedo resuelto.
+    """
+    return f"✅ Cerrado: {esc(tarea)}"
+
+
 ARRANQUE = (
     "⛵ Mástil iniciado. Calendario + Pomodoro + Timer activos. "
     "Usa /admin para ver comandos."
@@ -576,17 +634,17 @@ def esc(value: object) -> str:
 
 
 LITE_AYUDA = (
-    "<b>No pude guardar el recordatorio.</b>\n\n"
-    "Escríbelo así:\n\n"
-    "<code>recordar hoy 21:30 bañarme</code>\n"
-    "<code>recordar 9 de agosto 10:30 salir</code>"
+    "<b>No entendí eso.</b>\n\n"
+    "Escribe <b>recordar</b> y yo te voy preguntando lo demás.\n\n"
+    "También puedes escribirlo todo de una vez, así:\n"
+    "<code>recordar hoy 21:30 bañarme</code>"
 )
 
 LITE_BIENVENIDA = (
     "<b>Hola.</b>\n\n"
-    "Para crear un recordatorio escribe así:\n\n"
-    "<code>recordar hoy 21:30 bañarme</code>\n"
-    "<code>recordar 9 de agosto 10:30 salir</code>"
+    "Para crear un recordatorio escribe <b>recordar</b>.\n"
+    "Yo te voy preguntando lo demás, de a una cosa por vez.\n\n"
+    "Para ver los que ya tienes, escribe <b>recuérdame</b>."
 )
 
 LITE_SIN_PENDIENTES = "<b>No tienes recordatorios pendientes.</b>"
@@ -623,6 +681,67 @@ def lite_listado(items: list[tuple[str, str, str]]) -> str:
             f"🔔 <b>{esc(activity)}</b>"
         )
     return "\n\n".join(lines)
+
+
+# --- flujo guiado: una pregunta por mensaje -------------------------------
+#
+# La puerta de entrada y la de salida son siempre la misma palabra: «recordar».
+# Nunca hay que memorizar un formato: el sistema pregunta, ella contesta.
+#
+# Sigue sin haber botones ni menús, igual que antes.
+
+LITE_GUIA_ACTIVIDAD = (
+    "<b>¿Qué quieres que te recuerde?</b>\n\n"
+    "Escríbelo con tus palabras.\n\n"
+    "<i>Si no quieres seguir, escribe: nada</i>"
+)
+
+LITE_GUIA_DIA = (
+    "<b>¿Qué día?</b>\n\n"
+    "Escribe <b>hoy</b>, <b>mañana</b>, o la fecha: <b>9 de agosto</b>."
+)
+
+LITE_GUIA_DIA_OTRA_VEZ = (
+    "<b>No entendí el día.</b>\n\n"
+    "Escribe <b>hoy</b>, <b>mañana</b>, o la fecha: <b>9 de agosto</b>."
+)
+
+LITE_GUIA_HORA = "<b>¿A qué hora?</b>\n\nPor ejemplo: <b>9:30</b>."
+
+LITE_GUIA_HORA_OTRA_VEZ = (
+    "<b>No entendí la hora.</b>\n\n"
+    "Escríbela con números. Por ejemplo: <b>9:30</b>."
+)
+
+LITE_GUIA_HORA_PASADA = (
+    "<b>Esa hora de hoy ya pasó.</b>\n\n"
+    "Dime otra hora, o escribe <b>mañana</b> y lo dejamos para mañana."
+)
+
+LITE_GUIA_FRANJA = "<b>¿De la mañana o de la tarde?</b>"
+
+LITE_GUIA_MANANA = "<b>Bueno, mañana.</b>\n\n¿A qué hora?"
+
+LITE_GUIA_CANCELADO = (
+    "<b>Listo, no guardé nada.</b>\n\n"
+    "Cuando quieras, escribe <b>recordar</b>."
+)
+
+LITE_GUIA_CONFIRMA_OTRA_VEZ = "Responde <b>sí</b> o <b>no</b>."
+
+# Cierre del flujo guiado: termina ofreciendo la misma puerta por la que entró.
+LITE_INVITACION = "\n\n———\nPara crear otro, escribe <b>recordar</b>."
+
+
+def lite_guia_confirmar(display_date: str, display_time: str, activity: str) -> str:
+    return (
+        "<b>¿Está bien así?</b>\n\n"
+        f"📅 <b>Fecha:</b> <b>{esc(display_date)}</b>\n"
+        f"🕘 <b>Hora:</b> <b>{esc(display_time)}</b>\n\n"
+        "🔔 <b>Recordatorio:</b>\n"
+        f"<b>{esc(activity)}</b>\n\n"
+        "Responde <b>sí</b> o <b>no</b>."
+    )
 
 
 # --- avisos al propietario: sólo el hecho, nunca el contenido -------------
@@ -844,9 +963,6 @@ GMAIL_DESHABILITADO = (
 
 
 # ==========================================================================
-
-
-# ==========================================================================
 # Intervalos — cronómetro de vueltas
 # ==========================================================================
 # Registra horas y calcula cuánto pasó entre una y otra. Nada más.
@@ -858,6 +974,15 @@ GMAIL_DESHABILITADO = (
 INTERVALOS_TITULO = "📊 MARCAS DEL CICLO"
 INTERVALOS_INICIO = "Inicio"
 INTERVALOS_SIN_MARCAS = "No hay marcas en el ciclo actual."
+
+
+def intervalos_marca_borrada(resumen: str) -> str:
+    return f"🗑️ Borré la marca {resumen}."
+
+
+INTERVALOS_BORRAR_SIN_MARCAS = (
+    "No hay ninguna marca que borrar en el ciclo actual."
+)
 
 
 def intervalos_ocultas(cantidad: int) -> str:
@@ -888,27 +1013,28 @@ INTERVALOS_SIN_CICLO = "No hay ningún ciclo abierto."
 # dedo mal apoyado.
 INTERVALOS_BOTONES = [("📍 Marca", "/marca"), ("⏱ Tiempo", "/tiempo")]
 
+INTERVALOS_CONTEXTO_PREGUNTA = "🧩 ¿Qué estaba pasando?"
+INTERVALOS_CONTEXTO_OTRO = "✏️ Escribe el contexto brevemente."
+INTERVALOS_CONTEXTO_GUARDADO = "✅ Contexto guardado."
+INTERVALOS_CONTEXTO_EXPIRADO = "Este contexto ya no está disponible. La marca quedó guardada."
+
+
+def intervalos_contexto_botones(mark_id: int):
+    """Los callbacks llevan el id para que un botón viejo jamás toque otra marca."""
+    return [
+        [("😣 ESTRÉS / EMOCIÓN", f"/contexto estres {mark_id}")],
+        [("⚡ URGENCIA ALTA", f"/contexto urgencia {mark_id}")],
+        [("💤 SUEÑO / CANSANCIO", f"/contexto sueno_cansancio {mark_id}")],
+        [("🕳️ ABURRIMIENTO / TIEMPO MUERTO", f"/contexto aburrimiento {mark_id}")],
+        [("📍 CONTEXTO / SEÑAL", f"/contexto senal {mark_id}")],
+        [
+            ("✏️ OTRO", f"/contexto otro {mark_id}"),
+            ("↩️ SIN CONTEXTO", f"/contexto sin {mark_id}"),
+        ],
+    ]
+
 
 INTERVALOS_AVISO = "⏱ Intervalo cumplido."
-
-# Una consulta por intervalo. No ofrece salida ni segunda vía a propósito: la
-# única forma de volver a mirar es marcar de nuevo.
-# La primera consulta del intervalo es libre. Las que siguen no se prohíben:
-# se les pone delante una decisión. Mirar el reloj a cada rato no acorta la
-# espera, pero a veces orientarse hace falta de verdad — y Mástil no está para
-# impedir una conducta funcional, sólo para cortar el automatismo.
-INTERVALOS_TIEMPO_FRICCION = (
-    "⏱️ Ya consultaste el tiempo de este intervalo.\n\n"
-    "¿Necesitas volver a orientarte?"
-)
-
-INTERVALOS_TIEMPO_BOTONES = [
-    [("✅ MOSTRAR", "/tiempo_mostrar")],
-    [("↩️ DEJARLO", "/tiempo_dejarlo")],
-]
-
-INTERVALOS_TIEMPO_DEJADO = "↩️ Lo dejamos."
-
 
 def intervalos_ciclo_cerrado(marcas: int, total: str) -> str:
     """Sólo el hecho de lo que se cerró. Sin balance ni comentario."""
@@ -929,6 +1055,11 @@ def intervalos_ciclo_cerrado(marcas: int, total: str) -> str:
 # comandos no saben hacer: navegar editando el mismo mensaje y pedir un dato.
 
 PANEL_HOME = ("🏠 PANEL", "panel:home")
+
+# Lo que queda en la pantalla vieja cuando el panel se mueve al final de
+# la conversacion. Sin botones: un menu viejo que todavia responde contesta
+# lejos de donde estas mirando, y eso es la mitad del desorden.
+PANEL_APAGADO = "⚓ MÁSTIL · el panel siguió abajo ↓"
 
 PANEL_TITULO = "⚓ MÁSTIL"
 
@@ -1008,6 +1139,36 @@ PANEL_VIG_FOTO_BOTONES = [
     [PANEL_HOME],
 ]
 
+# --- cuántas fotos ------------------------------------------------------
+#
+# El análisis se dispara al llegar la foto, así que hay que saber ANTES si
+# viene una sola o si conviene esperar la segunda. La pregunta es operativa
+# —cuántas vas a mandar—, no una evaluación de qué tan difícil está: eso
+# último sería pedir criterio justo frente al desorden que lo impide.
+
+PANEL_VIG_CUANTAS = (
+    "📸 ¿Cuántas fotos vas a mandar?\n\n"
+    "Con dos ángulos del mismo lugar se entiende mejor un escenario cargado. "
+    "Cuestan lo mismo: van juntas en una sola consulta."
+)
+
+PANEL_VIG_CUANTAS_BOTONES = [
+    [("1️⃣ UNA FOTO", "panel:vig:foto:1")],
+    [("2️⃣ DOS FOTOS", "panel:vig:foto:2")],
+    [("↩️ VOLVER AL CONTEXTO", "panel:vig:ctx")],
+    [PANEL_HOME],
+]
+
+PANEL_VIG_FOTO_PRIMERA = (
+    "📸 Manda la primera de las dos.\n\n"
+    "Cuando llegue te pido la segunda. Recién ahí se analizan, juntas."
+)
+
+VIGIA_PRIMERA_RECIBIDA = (
+    "📸 Primera recibida. Manda la segunda, desde otro ángulo.\n\n"
+    "Todavía no analizo nada: espero las dos."
+)
+
 # Cancelar borra objetivo, estrategia y bloque. Un toque accidental no debería
 # poder hacerlo, igual que con el /reset de Intervalos.
 PANEL_VIGIA_CANCELAR = "✖️ ¿Cerrar el objetivo en curso?"
@@ -1022,7 +1183,9 @@ PANEL_VIGIA_CANCELAR_BOTONES = [
 PANEL_INTERVALOS_TITULO = "⏱️ INTERVALOS"
 
 PANEL_INTERVALOS_BOTONES = [
-    [("📍 MARCA", "/marca"), ("⌛ TIEMPO", "/tiempo")],
+    [("📍 MARCA", "/marca")],
+    [("🧩 MARCAR + CONTEXTO", "/marca_contexto")],
+    [("⌛ TIEMPO", "/tiempo")],
     [("🔄 RESET", "panel:int:reset"), ("📊 REPORTE", "panel:int:reporte")],
     [PANEL_HOME],
 ]
@@ -1067,6 +1230,20 @@ def reporte_listo(desde: str, hasta: str, archivo: str) -> str:
 
 # /reset cierra el ciclo en curso. Un toque accidental no debería poder
 # hacerlo, así que acá —y sólo acá— el panel agrega una confirmación.
+# Borrar la ultima marca. Se nombra por numero y tramo porque asi es como
+# se la mira en la tabla: horas de reloj no aparecen en ningun lado.
+
+def panel_borrar_marca(resumen: str) -> str:
+    return f"🗑️ ¿Borrar la marca {resumen}?"
+
+
+PANEL_BORRAR_MARCA_BOTONES = [
+    [("✅ BORRAR", "panel:sys:borrar:ok")],
+    [("↩️ VOLVER", "panel:system")],
+]
+
+PANEL_BORRAR_SIN_MARCAS = "🗑️ No hay ninguna marca en el ciclo actual."
+
 PANEL_INTERVALOS_RESET = "🔄 ¿Cerrar el ciclo actual?"
 
 PANEL_INTERVALOS_RESET_BOTONES = [
@@ -1088,7 +1265,28 @@ PANEL_CALENDAR_BOTONES = [
 # el panel no los toca. Lo único que resuelve el botón es el día.
 PANEL_CAL_RAZON = "📝 ¿Razón?"
 PANEL_CAL_FECHA = "📆 ¿Fecha? (DD/MM)"
-PANEL_CAL_HORA = "🕘 ¿Hora? (HH:MM)"
+PANEL_CAL_HORA = (
+    "🕘 ¿Hora?\n\n"
+    "Ejemplos: 9:30 · 1:30 p · 21:30\n"
+    "Si no aclaras a (am) o p (pm), te pregunto."
+)
+
+PANEL_CAL_AMPM = "🕘 ¿AM o PM?"
+
+PANEL_CAL_AMPM_BOTONES = [
+    [("🌅 AM", "panel:cal:am"), ("🌆 PM", "panel:cal:pm")],
+    [PANEL_HOME],
+]
+
+PANEL_CAL_SIN_CERO = (
+    "🕘 Las 00 no se usan.\n\n"
+    "La medianoche se escribe 12 a. ¿Hora?"
+)
+
+PANEL_CAL_HORA_INVALIDA = (
+    "🕘 No entendí esa hora.\n\n"
+    "Ejemplos: 9:30 · 1:30 p · 21:30"
+)
 
 # --- Timer ---------------------------------------------------------------
 
@@ -1149,18 +1347,17 @@ PANEL_TIMER_CUENTA_BOTONES = [
 # --- avisar a -------------------------------------------------------------
 # Sin atajos de hora a proposito: una hora util es cualquiera, y seis botones
 # con horas redondas serian seis botones que casi nunca sirven.
-PANEL_TIMER_HORA = (
-    "🕐 AVISAR A\n\n"
-    "Una sola vez, a la hora que digas.\n"
+#
+# Pide la hora directo, con la misma lectura que el Calendario: reloj de 12
+# con `a`/`p`, y si no se aclara, pregunta AM o PM. Un aviso temprano puede
+# caer a la misma hora de la mañana o de la noche: adivinar ahí es avisar doce
+# horas corrido.
+PANEL_TIMER_PIDE_HORA = (
+    "🕐 Pon la hora del aviso.\n\n"
+    "Ejemplos: 7 · 7:30 a · 1 p · 21:40\n"
+    "Si no aclaras a (am) o p (pm), te pregunto.\n"
     "Si esa hora ya pasó hoy, queda para mañana."
 )
-
-PANEL_TIMER_HORA_BOTONES = [
-    [("🕐 ELEGIR LA HORA", "panel:tm:hora:pedir")],
-    [("⬅️ VOLVER", "panel:timer")],
-]
-
-PANEL_TIMER_PIDE_HORA = "🕐 ¿A qué hora? Escríbela así: 21:40"
 
 # --- repetitivo -----------------------------------------------------------
 PANEL_TIMER_CADA = "🔁 REPETITIVO\n\n¿Cada cuánto?"
@@ -1197,7 +1394,41 @@ def panel_timer_duracion_botones(cada: int) -> list:
 
 PANEL_TIMER_PIDE_CADA = "🔁 ¿Cada cuántos minutos?"
 
-PANEL_TIMER_OTRO = "✏️ ¿Cuántos minutos?"
+PANEL_TIMER_OTRO = (
+    "✏️ ¿Cuánto?\n\n"
+    "Minutos: 7\n"
+    "Minutos y segundos: 7:10"
+)
+
+
+def _duracion_nombre(segundos: int) -> str:
+    """Como se nombra la duracion pedida: `10 minutos`, `1 minuto`, `4:20 minutos`.
+
+    Redondo se dice en minutos; con segundos se dice como se escribio,
+    para que lo que ves sea lo que pediste. La comparten el anuncio de
+    inicio y el de fin, para que los dos la digan igual.
+    """
+    if segundos % 60 == 0:
+        minutos = segundos // 60
+        return f"{minutos} minuto{'s' if minutos != 1 else ''}"
+    return f"{segundos // 60}:{segundos % 60:02d} minutos"
+
+
+def timer_duracion(segundos: int) -> str:
+    """La duracion en el anuncio de inicio."""
+    return f"{_duracion_nombre(segundos)}."
+
+
+def timer_terminado(segundos: int) -> str:
+    """El aviso de fin de la cuenta atras, con la duracion que tenia.
+
+    "Timer terminado" a secas no decia cual: con varios en el dia, o uno
+    largo, no se sabia que era lo que habia terminado. Sin una duracion
+    confiable se dice como antes, en vez de inventar una.
+    """
+    if not segundos or segundos <= 0:
+        return "⏰ Timer terminado."
+    return f"⏰ Timer de {_duracion_nombre(segundos)} terminado."
 PANEL_TIMER_CONFIG_MINUTOS = "⏲️ ¿Cuántos minutos?"
 
 PANEL_TIMER_AVISOS = "🔔 ¿Avisos?"
@@ -1220,6 +1451,18 @@ PANEL_TIMER_RAZON_PIDE = "📝 Escribe la razón:"
 # --- Pomodoro ------------------------------------------------------------
 
 PANEL_POMODORO_TITULO = "🍅 POMODORO"
+
+
+def panel_pomodoro_titulo(trabajo: int, descanso: int) -> str:
+    """La pantalla dice la duracion vigente y lo que sugiere para el corte.
+
+    Sin HTML: el Panel encola sin `parse_mode`.
+    """
+    return (
+        f"{PANEL_POMODORO_TITULO}\n\n"
+        f"⏱️ Trabajo: {trabajo} min\n"
+        f"🧘 Descanso recomendado: {descanso} min"
+    )
 
 PANEL_POMODORO_BOTONES = [
     [("▶️ INICIAR", "/pomodoro")],
@@ -1270,6 +1513,7 @@ PANEL_SYSTEM_BOTONES = [
     [("🛠️ ADMIN", "/admin"), ("📊 ESTADO", "/estado")],
     [("⏸️ SUSPENDER", "/suspender"), ("▶️ REANUDAR", "/reanudar")],
     [("🚫 CANCELAR", "/cancelar"), ("🧹 RESET ESTADO", "/reset_estado")],
+    [("🗑️ BORRAR INTERVALO", "panel:sys:borrar")],
     [("🎁 MENSAJE ASISTIDO", "panel:sys:sorpresa")],
     [("👩‍🦳 RECORDATORIOS ASISTIDOS", "/recordatorios_lite")],
     [PANEL_HOME],
@@ -1289,6 +1533,7 @@ PANEL_SORPRESA_MENU = (
 PANEL_SORPRESA_MENU_BOTONES = [
     [("📸 CON FOTO", "panel:sor:foto")],
     [("💬 SIN FOTO", "panel:sor:texto")],
+    [("❓ PREGUNTA ASISTIDA", "panel:sor:pregunta")],
     [("❌ CANCELAR", "panel:sor:cancelar")],
 ]
 
@@ -1330,6 +1575,68 @@ SORPRESA_SIN_FLUJO = "No hay ninguna sorpresa a medio crear."
 SORPRESA_PIDE_FOTO_DE_NUEVO = "🔄 Manda la foto nueva 📸"
 
 
+# --- pregunta cerrada para la usuaria asistida -----------------------------------------
+
+ASISTQ_PIDE_PREGUNTA = "❓ ¿Qué quieres preguntarle?"
+ASISTQ_PIDE_OPCION_A = "🔘 Escribe la PRIMERA respuesta."
+ASISTQ_PIDE_OPCION_B = "🔘 Escribe la SEGUNDA respuesta."
+ASISTQ_TEXTO_VACIO = "⚠️ Necesito que escribas un texto."
+ASISTQ_OPCION_LARGA = (
+    "⚠️ Esa respuesta es demasiado larga para un botón.\n"
+    "Escríbela más corta."
+)
+ASISTQ_PREGUNTA_LARGA = "⚠️ La pregunta es demasiado larga. Escríbela más corta."
+ASISTQ_OPCIONES_IGUALES = "⚠️ Las dos respuestas deben ser distintas."
+ASISTQ_ENVIADA = "✅ Pregunta enviada."
+ASISTQ_CANCELADA = "❌ Pregunta cancelada."
+ASISTQ_SIN_BORRADOR = "No hay ninguna pregunta a medio crear."
+ASISTQ_SIN_DESTINO = "No hay ninguna usuaria configurada para recibirla."
+ASISTQ_ERROR_ENVIO = "No pude enviar la pregunta. Intenta de nuevo."
+ASISTQ_YA_RESPONDIDA = "✅ Ya respondiste esta pregunta."
+ASISTQ_NO_DISPONIBLE = "Esta pregunta ya no está disponible."
+ASISTQ_RESPUESTA_REGISTRADA = "✅ Respuesta registrada."
+
+ASISTQ_ACCIONES = [
+    [("✅ ENVIAR", "panel:asistq:enviar")],
+    [("✏️ EDITAR", "panel:asistq:editar")],
+    [("❌ CANCELAR", "panel:asistq:cancelar")],
+]
+
+
+def pregunta_asistida(texto: str) -> str:
+    return sorpresa(texto)
+
+
+def pregunta_asistida_preview_botones(opcion_a: str, opcion_b: str):
+    return [
+        [(opcion_a, "panel:asistq:preview:a")],
+        [(opcion_b, "panel:asistq:preview:b")],
+        *ASISTQ_ACCIONES,
+    ]
+
+
+def pregunta_asistida_botones(question_id: int, opcion_a: str, opcion_b: str):
+    return [
+        [(opcion_a, f"asistq:{question_id}:a")],
+        [(opcion_b, f"asistq:{question_id}:b")],
+    ]
+
+
+def pregunta_asistida_respondida(pregunta: str, respuesta: str) -> str:
+    return (
+        f"{sorpresa(pregunta)}\n\n"
+        f"✅ Respondiste:\n{respuesta}"
+    )
+
+
+def pregunta_asistida_notificacion(pregunta: str, respuesta: str) -> str:
+    return (
+        "👩‍🦳 RESPUESTA ASISTIDA\n\n"
+        f"❓ {pregunta}\n\n"
+        f"✅ {respuesta}"
+    )
+
+
 PANEL_SORPRESA_PIDE = "🎁 Escribe el mensaje para la usuaria asistida:"
 
 # Único teclado de los pasos que esperan texto: la salida del flujo.
@@ -1369,12 +1676,32 @@ def cola_pendientes(pendientes: int) -> str:
     )
 
 
-def cola_decision(titulo: str, programado: str) -> str:
-    """La hora que se muestra es la original. Presentarlo tarde no la cambia."""
+def cola_ancla(titulos: list) -> str:
+    """La unica tarjeta persistente mientras otra tarea esta activa.
+
+    Lista todo lo que espera, en el orden en que se va a ofrecer, con la
+    siguiente en negrita. Un número ("+2 en cola") obligaba a acordarse de qué
+    había detrás.
+    """
+    lineas = [f"- <b>{esc(titulos[0])}</b>"] if titulos else []
+    lineas += [f"- {esc(t)}" for t in titulos[1:]]
+    return "📥 <b>SIGUIENTE PENDIENTE</b>\n\n" + "\n".join(lineas)
+
+
+def cola_decision(titulo: str, programado: str, en_cola=None) -> str:
+    """La hora que se muestra es la original. Presentarlo tarde no la cambia.
+
+    Debajo lista lo que sigue esperando, uno por línea.
+    """
+    en_cola = list(en_cola or [])
+    espera = (
+        "\n\nEn cola:\n" + "\n".join(f"- {esc(t)}" for t in en_cola)
+        if en_cola else ""
+    )
     return (
         f"{COLA_DECISION_TITULO}\n\n"
         f"<b>{esc(titulo)}</b>\n"
-        f"Programado: {esc(programado)}"
+        f"Programado: {esc(programado)}{espera}"
     )
 
 
@@ -1431,6 +1758,19 @@ GMAIL_BOTONES_LIMITE = [
     [("⏳ DEJARLO", "/gmail_dejarlo")],
 ]
 
+
+def gmail_confirma_disponible(comando: str, quedan: int) -> str:
+    """La pregunta antes de gastar una revisión que todavía hay.
+
+    Un toque sin querer no debería costar una revisión, y decir cuántas
+    quedan muestra el precio antes de pagarlo. Agotadas, no pasa por acá:
+    sigue la fricción de siempre.
+    """
+    nombre = GMAIL_NOMBRES.get(comando, "esta revisión")
+    cupo = ("Te queda 1 revisión" if quedan == 1
+            else f"Te quedan {quedan} revisiones")
+    return f"📬 ¿Revisar «{nombre}»?\n\n{cupo} hoy."
+
 GMAIL_PIDE_MOTIVO = (
     "🧠 ANTES DE REVISAR\n\n"
     "¿Qué necesitas comprobar exactamente?"
@@ -1456,6 +1796,17 @@ GMAIL_BOTONES_CONFIRMAR = [
 ]
 
 GMAIL_DEJADO = "⏳ Lo dejamos por ahora."
+
+# --- modo simple (temporal) ---------------------------------------------
+#
+# Una sola pregunta y nada mas. Ver `FRICCION_COMPLETA` en modules/gmail.py.
+
+GMAIL_CONFIRMA_SIMPLE = "📬 ¿Seguro deseas revisar?"
+
+GMAIL_BOTONES_SIMPLE = [
+    [("✅ SÍ, REVISAR", "/gmail_igual")],
+    [("⏳ DEJARLO", "/gmail_dejarlo")],
+]
 
 GMAIL_SIN_FRICCION = "No hay ninguna revisión pendiente de confirmar."
 
@@ -1488,6 +1839,9 @@ MOMENTO:
 MOTIVO DECLARADO (texto exacto del usuario):
 "{motivo}"
 
+MOTIVOS QUE YA HABÍA ESCRITO ANTES (del más reciente al más antiguo):
+{historial}
+
 CONTEXTO OPERATIVO CONOCIDO POR MÁSTIL:
 {contexto}
 Mástil no tiene forma de saber si esos elementos se relacionan con este buzón.
@@ -1498,6 +1852,9 @@ QUÉ HACER:
   compromiso ya acordado) y una comprobación general ("ver si hay algo nuevo").
 - Si hay una razón concreta y temporal, dilo y respáldala.
 - Si no la hay, dilo con claridad y sugiere dejarlo para mañana.
+- Compara el motivo de hoy con los anteriores. Si repite una razón ya usada,
+  dilo y cita el parecido concreto. Es un hecho observable en el texto, no un
+  reproche ni una interpretación de por qué lo escribió.
 - La decisión final es suya. Recomienda, no ordenes.
 
 QUÉ NO HACER, EN NINGÚN CASO:
@@ -1521,6 +1878,46 @@ def gmail_contexto_operativo(evento: str | None, pendientes: int) -> str:
     )
     lineas.append(f"- Eventos pendientes de decisión en la cola: {pendientes}.")
     lineas.append("- Plazos o compromisos explícitos registrados: ninguno.")
+    return "\n".join(lineas)
+
+
+def vigia_nota_fotos(cuantas: int) -> str:
+    """Qué son las imágenes adjuntas al análisis.
+
+    Con dos hay que decir explícitamente que son el mismo lugar. Sin eso el
+    modelo puede leerlas como dos ambientes distintos y planificar el doble
+    del trabajo que hay.
+    """
+    if int(cuantas or 1) >= 2:
+        return (
+            "Las DOS fotos adjuntas son dos vistas del MISMO lugar, tomadas en "
+            "el mismo\nmomento desde ángulos distintos. No son dos ambientes ni "
+            "dos momentos:\núsalas juntas para entender una sola escena.\n\n"
+            "Son el ESTADO ACTUAL del entorno, no la especificación del "
+            "problema:\ncombínalas con el objetivo, el contexto y el plan."
+        )
+    return (
+        "La foto adjunta es el ESTADO ACTUAL del entorno. No es la "
+        "especificación del\nproblema: combínala con el objetivo, el contexto "
+        "y el plan."
+    )
+
+
+def gmail_historial_motivos(motivos: list) -> str:
+    """Los motivos anteriores, tal como se escribieron.
+
+    Sin esto cada revisión se juzga sola, y una fórmula repetida treinta veces
+    pasa treinta veces: la fricción se gasta sin que nadie lo note. El texto va
+    entero y sin resumir, porque lo que delata una excusa hecha costumbre es
+    justamente que se repite palabra por palabra.
+    """
+    if not motivos:
+        return "- (ninguno registrado todavía)"
+    lineas = []
+    for entrada in reversed(motivos):
+        cuando = str(entrada.get("cuando") or "")[:16].replace("T", " ")
+        texto = str(entrada.get("motivo") or "").strip() or "(en blanco)"
+        lineas.append(f'- {cuando}: "{texto}"')
     return "\n".join(lineas)
 
 
@@ -1655,8 +2052,14 @@ VIGIA_BOTONES = [
 ]
 
 # Cuando ya está esperando una foto, "bloque terminado" sería redundante.
+# Mandar dos fotos vive acá, junto al pedido, y no sólo dentro del Panel: la
+# decisión se toma mirando el desorden, no navegando menús. Una es el modo por
+# defecto, así que el único botón que hace falta es el que pide la otra.
+VIGIA_BOTON_DOS_FOTOS = ("2️⃣ VOY A MANDAR DOS", "panel:vig:foto:2")
+
 VIGIA_BOTONES_ESPERA = [
     [("➡️ SIGUIENTE", "/vigia_siguiente")],
+    [VIGIA_BOTON_DOS_FOTOS],
     [("🆘 ME TRABÉ", "/vigia_trabado")],
     [PANEL_HOME],
 ]
@@ -1705,6 +2108,7 @@ VIGIA_TRABADO_EXIGE_FOTO = (
 # es completar el contexto o irse.
 VIGIA_BOTONES_INICIO = [
     [("📋 CONTEXTO", "panel:vig:ctx")],
+    [VIGIA_BOTON_DOS_FOTOS],
     [PANEL_HOME],
 ]
 
@@ -1785,8 +2189,7 @@ BLOQUES DADOS POR HECHOS SIN COMPROBAR: {declarados}
 
 LA PERSONA DICE QUE SE TRABÓ: {trabado}
 
-La foto adjunta es el ESTADO ACTUAL del entorno. No es la especificación del
-problema: combínala con el objetivo, el contexto y el plan.
+{fotos}
 
 LA FOTO SIEMPRE GANA. Si contradice lo que se dio por hecho, corrige el plan
 según lo que ves. No lo señales ni lo reproches: sólo reencuadra.

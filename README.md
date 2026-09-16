@@ -37,12 +37,12 @@ en cada paso.
 | | |
 |---|---|
 | **Lenguaje** | Python 3.11+ |
-| **Persistencia** | SQLite (15 tablas, sin ORM) |
+| **Persistencia** | SQLite (17 tablas, sin ORM) |
 | **Dependencias externas** | **ninguna** — sólo biblioteca estándar |
 | **APIs** | Telegram Bot API · Gemini Vision API · Google Calendar (iCal + Apps Script) |
 | **Despliegue** | VM Linux (Google Cloud) con `systemd` |
-| **Pruebas** | 18 suites · 932 aserciones · reloj falso, sin sleeps reales |
-| **Tamaño** | ~10.100 líneas de Python |
+| **Pruebas** | 37 suites · 1.636 aserciones · reloj falso, sin sleeps reales |
+| **Tamaño** | ~13.300 líneas de Python |
 
 La ausencia de dependencias es una decisión de diseño, no una carencia. Está
 documentada en `requirements.txt`: *una instalación sin dependencias es una
@@ -270,7 +270,7 @@ documentado en `.env.example`.
 bash pruebas/correr.sh
 ```
 
-18 suites, 932 aserciones, **deterministas**: reloj falso, dobles de Telegram y
+37 suites, 1.636 aserciones, **deterministas**: reloj falso, dobles de Telegram y
 de Gemini, y una base temporal que se destruye sola. No tocan servicios reales.
 
 El patrón del reloj falso es lo que permite verificar un plazo de 70 minutos en
@@ -290,16 +290,18 @@ sched.now_local = lambda: RELOJ["t"]
 ├── config.py               configuración; TODAS las rutas derivan de __file__
 ├── database.py             SQLite, outbox, estado y migraciones aditivas
 ├── messages.py             todo el texto y los prompts, en un solo lugar
-├── schema.sql              15 tablas
+├── schema.sql              17 tablas
 ├── core/
 │   ├── runtime.py          el bucle y la composición
 │   ├── router.py           despacho de updates
+│   ├── message_policy.py   ventana de mensajes visibles en el chat
 │   └── scheduler.py        reglas de tiempo, deterministas
 ├── integrations/           Telegram · Calendar · Gmail · Vision
 ├── modules/                un archivo por módulo
 ├── scripts/                respaldo y migración
 ├── apps_script/            puente de Calendar (Google Apps Script)
-└── pruebas/                18 suites con reloj falso
+├── tests/                  pruebas unitarias con unittest
+└── pruebas/                37 suites con reloj falso
 ```
 
 ---

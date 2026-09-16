@@ -13,8 +13,7 @@ Tres decisiones que sostienen el módulo:
 - **Sin opinión.** No hay rachas, récords ni comparaciones. El aviso sólo
   informa que terminó la espera; el cronómetro sigue siendo un instrumento,
   no un juez.
-- **Sin acoplamiento.** No comparte estado con nadie. Que dos
-  módulos hablen del mismo tema no significa que deban tocarse.
+- **Sin acoplamiento.** No comparte estado con otros módulos.
 - **Sólo se guardan hechos.** La base almacena horas. El tramo y el total se
   calculan al mostrarlos, así que nunca pueden discrepar con el dato real.
 """
@@ -33,15 +32,18 @@ MAX_FILAS = 10
 # en el tiempo, y las marcas anteriores siguen intactas donde estaban.
 RESET_KEY = "intervalos_reset_at"
 
-# Qué marca ya usó su consulta libre de `/tiempo`.
-#
-# Guarda el `id` de esa marca, no un contador: el id ES la identidad del
-# intervalo, así que marcar de nuevo devuelve la consulta libre sin resetear
-# nada. Tampoco hace falta contar las repeticiones — todas caen en la misma
-# fricción, y contarlas sólo serviría para ponerles un tope que no queremos.
-# Va en `system_state` por lo mismo que RESET_KEY —sobrevive al reinicio y no
-# obliga a una columna nueva— y no toca ni el cálculo ni el historial.
-TIEMPO_USADO_KEY = "intervalos_tiempo_usado"
+# Sólo existe mientras el usuario está eligiendo un contexto para UNA marca.
+# Vive en la BD para que un reinicio no haga que un texto posterior termine en
+# otra marca, y los botones incluyen el mismo id como protección adicional.
+CONTEXTO_PENDIENTE_KEY = "intervalos_contexto_pendiente"
+
+CONTEXTOS_DIRECTOS = {
+    "estres",
+    "urgencia",
+    "sueno_cansancio",
+    "aburrimiento",
+    "senal",
+}
 
 # Cuánto dura la espera a ciegas desde una marca hasta el aviso.
 ESPERA_MINUTOS = 76
@@ -212,18 +214,59 @@ class IntervalosModule:
 
     # ------------------------------------------------------------ comandos
 
-    def handle(self, command: str, source_id: object = None) -> bool:
+    def handle(
+        self,
+        command: str,
+        source_id: object = None,
+        raw_text: str = "",
+    ) -> bool:
         if command == "/marca":
             return self._marcar(source_id)
+        if command == "/marca_contexto":
+            return self._marcar_con_contexto(source_id)
+        if command == "/contexto":
+            return self._guardar_contexto(raw_text)
         if command == "/tiempo":
             return self._tiempo()
-        if command == "/tiempo_mostrar":
-            return self._tiempo_mostrar()
-        if command == "/tiempo_dejarlo":
-            return self._tiempo_dejarlo()
         if command == "/reset":
             return self._reset()
+        if command == "/borrar_marca":
+            return self._borrar_ultima()
         return False
+
+    def abandon_contexto(self) -> None:
+        """Un comando explícito significa que el texto pendiente ya no aplica."""
+        if self.db.get_state(CONTEXTO_PENDIENTE_KEY) is not None:
+            with self.db.transaction():
+                self.db.set_state(CONTEXTO_PENDIENTE_KEY, None)
+
+    def handle_text(self, text: str) -> bool:
+        """Sólo toma texto libre después de que el usuario eligió OTRO."""
+        pendiente = self.db.get_state(CONTEXTO_PENDIENTE_KEY)
+        if not isinstance(pendiente, dict) or pendiente.get("mode") != "otro":
+            return False
+
+        contexto = text.strip()
+        if not contexto:
+            return False
+
+        mark_id = pendiente.get("mark_id")
+        if not isinstance(mark_id, int):
+            self.abandon_contexto()
+            return False
+
+        with self.db.transaction():
+            self.db.execute(
+                """
+                UPDATE interval_marks
+                SET context_category = ?, context_text = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                ("otro", contexto, mark_id, self._user()),
+            )
+            self.db.set_state(CONTEXTO_PENDIENTE_KEY, None)
+            self._say(messages.INTERVALOS_CONTEXTO_GUARDADO, buttons=[])
+        return True
 
     def _reset(self) -> bool:
         """Cierra el ciclo en curso. No borra: mueve el punto de partida."""
@@ -248,7 +291,7 @@ class IntervalosModule:
             self.db.audit("intervalos", "reset", f"{len(marcas)} marcas")
         return True
 
-    def _marcar(self, source_id: object) -> bool:
+    def _crear_marca(self, source_id: object) -> int:
         ahora = datetime.now(timezone.utc)
         # Un mismo mensaje reintentado no puede generar dos marcas. Si no hay
         # identificador, el segundo cae de vuelta al segundo exacto.
@@ -258,16 +301,64 @@ class IntervalosModule:
         ya = self.db.one(
             "SELECT id FROM interval_marks WHERE request_id = ?", (request_id,)
         )
-        if not ya:
+        if ya:
+            return int(ya["id"])
+
+        with self.db.transaction():
+            cursor = self.db.execute(
+                """
+                INSERT INTO interval_marks
+                    (user_id, marked_at_utc, local_day, request_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (self._user(), ahora.isoformat(), self._hoy(), request_id),
+            )
+            return int(cursor.lastrowid)
+
+    def ultima_marca_resumen(self) -> str | None:
+        """Como nombrar la ultima marca: su numero en el ciclo y su tramo.
+
+        Es como se la nombra al mirarla ("la 6, la de 58 min"), y es lo que
+        la tabla muestra: horas de reloj no aparecen en ningun lado.
+        """
+        marcas = self._marcas_del_ciclo()
+        if not marcas:
+            return None
+        if len(marcas) == 1:
+            return f"{len(marcas)} ({messages.INTERVALOS_INICIO})"
+        ultimas = [datetime.fromisoformat(m["marked_at_utc"])
+                   for m in marcas[-2:]]
+        tramo = formato_duracion((ultimas[1] - ultimas[0]).total_seconds())
+        return f"{len(marcas)} ({tramo})"
+
+    def _borrar_ultima(self) -> bool:
+        """Borra la ultima marca del ciclo y vuelve a mostrar la tabla.
+
+        Existe porque un dedo se equivoca y una marca de mas desplaza todo
+        el resto del ciclo. No cierra nada ni reinicia nada: saca una fila
+        y muestra como queda, igual que despues de marcar.
+        """
+        marcas = self._marcas_del_ciclo()
+        if not marcas:
             with self.db.transaction():
-                self.db.execute(
-                    """
-                    INSERT INTO interval_marks
-                        (user_id, marked_at_utc, local_day, request_id)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (self._user(), ahora.isoformat(), self._hoy(), request_id),
-                )
+                self._say(messages.INTERVALOS_BORRAR_SIN_MARCAS)
+            return True
+
+        resumen = self.ultima_marca_resumen()
+        with self.db.transaction():
+            self.db.execute("DELETE FROM interval_marks WHERE id = ?",
+                            (marcas[-1]["id"],))
+            self.db.audit("intervalos", "borrar_marca",
+                          str(marcas[-1]["id"]))
+            quedan = self._marcas_del_ciclo()
+            self._say(
+                messages.intervalos_marca_borrada(resumen)
+                + "\n\n" + self._tabla(quedan)
+            )
+        return True
+
+    def _marcar(self, source_id: object) -> bool:
+        self._crear_marca(source_id)
 
         marcas = self._marcas_del_ciclo()
         with self.db.transaction():
@@ -275,6 +366,84 @@ class IntervalosModule:
                 self._tabla(marcas) + "\n"
                 + messages.intervalos_registrada(len(marcas), self._ultimo_tramo(marcas))
             )
+        return True
+
+    def _marcar_con_contexto(self, source_id: object) -> bool:
+        mark_id = self._crear_marca(source_id)
+        marcas = self._marcas_del_ciclo()
+
+        with self.db.transaction():
+            # La marca y la referencia al contexto quedan confirmadas antes de
+            # que Telegram muestre una sola pregunta.
+            self.db.set_state(
+                CONTEXTO_PENDIENTE_KEY,
+                {"mark_id": mark_id, "mode": "eleccion"},
+            )
+            self._say(
+                self._tabla(marcas) + "\n"
+                + messages.intervalos_registrada(len(marcas), self._ultimo_tramo(marcas))
+            )
+            self._say(
+                messages.INTERVALOS_CONTEXTO_PREGUNTA,
+                buttons=messages.intervalos_contexto_botones(mark_id),
+            )
+        return True
+
+    def _guardar_contexto(self, raw_text: str) -> bool:
+        partes = raw_text.split()
+        if len(partes) != 3:
+            return self._contexto_expirado()
+
+        _, categoria, raw_mark_id = partes
+        try:
+            mark_id = int(raw_mark_id)
+        except ValueError:
+            return self._contexto_expirado()
+
+        pendiente = self.db.get_state(CONTEXTO_PENDIENTE_KEY)
+        if (
+            not isinstance(pendiente, dict)
+            or pendiente.get("mark_id") != mark_id
+            or pendiente.get("mode") not in {"eleccion", "otro"}
+        ):
+            return self._contexto_expirado()
+
+        if categoria == "sin":
+            with self.db.transaction():
+                self.db.set_state(CONTEXTO_PENDIENTE_KEY, None)
+            return True
+
+        if categoria == "otro":
+            with self.db.transaction():
+                self.db.set_state(
+                    CONTEXTO_PENDIENTE_KEY,
+                    {"mark_id": mark_id, "mode": "otro"},
+                )
+                self._say(messages.INTERVALOS_CONTEXTO_OTRO, buttons=[])
+            return True
+
+        if categoria not in CONTEXTOS_DIRECTOS:
+            return self._contexto_expirado()
+
+        with self.db.transaction():
+            self.db.execute(
+                """
+                UPDATE interval_marks
+                SET context_category = ?, context_text = NULL
+                WHERE id = ? AND user_id = ?
+                """,
+                (categoria, mark_id, self._user()),
+            )
+            self.db.set_state(CONTEXTO_PENDIENTE_KEY, None)
+            self._say(
+                messages.INTERVALOS_CONTEXTO_GUARDADO,
+                buttons=[],
+            )
+        return True
+
+    def _contexto_expirado(self) -> bool:
+        with self.db.transaction():
+            self._say(messages.INTERVALOS_CONTEXTO_EXPIRADO, buttons=[])
         return True
 
     def _ultimo_tramo(self, marcas) -> str | None:
@@ -286,57 +455,24 @@ class IntervalosModule:
         return formato_duracion((ultima - previa).total_seconds())
 
     def _tiempo(self) -> bool:
-        """Sólo lectura. La primera del intervalo es libre; las demás, con
-        una decisión delante.
-
-        Mirar el reloj cada dos minutos no acorta la espera: la alarga, porque
-        cada consulta reinstala la espera en la cabeza. Pero orientarse a veces
-        hace falta de verdad, así que no se prohíbe — se interrumpe el
-        automatismo y se decide.
-        """
+        """Muestra de inmediato el tiempo desde la última marca."""
         marcas = self._marcas_del_ciclo()
         if not marcas:
             with self.db.transaction():
                 self._say(messages.INTERVALOS_SIN_MARCAS)
             return True
 
-        # El intervalo es la última marca. Guardar su id es lo que hace que
-        # marcar de nuevo devuelva la consulta libre, sin contadores.
-        actual = int(marcas[-1]["id"])
-        if self.db.get_state(TIEMPO_USADO_KEY) == actual:
-            with self.db.transaction():
-                self._say(messages.INTERVALOS_TIEMPO_FRICCION,
-                          buttons=messages.INTERVALOS_TIEMPO_BOTONES)
-            return True
-
         with self.db.transaction():
-            self.db.set_state(TIEMPO_USADO_KEY, actual)
             self._decir_tiempo(marcas)
         return True
 
     def _decir_tiempo(self, marcas) -> None:
-        """El cálculo, en un solo lugar: lo usan la consulta libre y MOSTRAR."""
+        """El cálculo del tiempo desde la última marca."""
         ultima = datetime.fromisoformat(marcas[-1]["marked_at_utc"])
         transcurrido = (datetime.now(timezone.utc) - ultima).total_seconds()
         self._say(messages.intervalos_desde_ultima(
             formato_duracion(transcurrido), len(marcas)
         ))
-
-    def _tiempo_mostrar(self) -> bool:
-        """Pasó la fricción. Se muestra, y la próxima vuelve a preguntarlo:
-        el estado no cambia, así que la decisión no se compra una sola vez."""
-        marcas = self._marcas_del_ciclo()
-        with self.db.transaction():
-            if not marcas:
-                self._say(messages.INTERVALOS_SIN_MARCAS)
-                return True
-            self._decir_tiempo(marcas)
-        return True
-
-    def _tiempo_dejarlo(self) -> bool:
-        with self.db.transaction():
-            self._say(messages.INTERVALOS_TIEMPO_DEJADO, buttons=[])
-        return True
 
     # -------------------------------------------------------------- tabla
 

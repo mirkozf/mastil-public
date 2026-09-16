@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import json
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
+from core.message_policy import MessagePolicy, EFIMERO_SEGUNDOS
 from core.router import Router
 from core.scheduler import now_local
 from integrations.calendar import CalendarBridge, CalendarPrivacy, read_events
@@ -26,7 +28,8 @@ from modules.guardian import GuardianModule
 from modules.intervalos import IntervalosModule
 from modules.gmail import GmailModule
 from modules.lite import LiteModule
-from modules.panel import PanelModule
+from modules.panel import (PanelModule, PANEL_MESSAGE_KEY,
+                           PANEL_OUTBOX_KEY)
 from modules.pomodoro import PomodoroModule
 from modules.system import SystemModule
 from modules.timer import TimerModule
@@ -36,6 +39,11 @@ import messages
 
 OFFSET_KEY = "telegram_offset"
 SUSPENDED_KEY = "suspended"
+# Suspensión exclusiva de Guardian. Vive en `system_state` como la global,
+# para no inventar un segundo mecanismo de suspensión.
+GUARDIAN_SUSPENDED_KEY = "guardian_suspended"
+# Fila de la outbox que, al enviarse, se marca para borrarse sola.
+EFIMERO_OUTBOX_KEY = "efimero_outbox_id"
 
 # Sólo para no girar en vacío si Telegram falla. El ritmo real del ciclo lo
 # marca el long polling de getUpdates.
@@ -64,6 +72,10 @@ class Runtime:
         self.db = db
 
         self.telegram = Telegram(config.telegram_bot_token)
+        self.message_policy = MessagePolicy(
+            db, self.telegram, config.owner_chat_id
+        )
+        self.message_policy.bind(self.telegram)
         # 90s y no los 45 por defecto: este Vision es el de Vigía, y su
         # llamada manda una foto con un prompt largo y espera JSON. Con 45
         # los timeouts eran frecuentes; Gmail usa el suyo, más corto.
@@ -82,10 +94,13 @@ class Runtime:
             "system": SystemModule(config, db, self.privacy, self.telegram),
             "calendar": CalendarCommandsModule(config, db, self.calendar_bridge),
             "timer": TimerModule(config, db),
-            "guardian": GuardianModule(config, db),
+            "guardian": GuardianModule(config, db, self.message_policy),
             "pomodoro": PomodoroModule(config, db),
             "lite": LiteModule(config, db),
-            "vigia": VigiaModule(config, db, self.telegram, self.vision, self.privacy),
+            "vigia": VigiaModule(
+                config, db, self.telegram, self.vision, self.privacy,
+                self.message_policy,
+            ),
             "gmail": GmailModule(config, db, self.gmail_bridge, self.telegram),
             "intervalos": IntervalosModule(config, db),
             "panel": PanelModule(config, db),
@@ -127,7 +142,11 @@ class Runtime:
             print(f"No pude sincronizar el offset inicial: {exc}", flush=True)
 
         with self.db.transaction():
-            self.db.enqueue(self.config.owner_chat_id, messages.ARRANQUE)
+            fila = self.db.enqueue(self.config.owner_chat_id,
+                                   messages.ARRANQUE)
+            # Confirma que el servicio volvio y se va solo: es un dato de
+            # los primeros segundos, no del resto del dia.
+            self.db.set_state(EFIMERO_OUTBOX_KEY, fila)
             self.db.audit("runtime", "boot")
 
     # --------------------------------------------------------------- ciclo
@@ -155,6 +174,13 @@ class Runtime:
                     f"[router] update_id={update.get('update_id')} error: {exc}",
                     flush=True,
                 )
+            finally:
+                message = update.get("message") or {}
+                chat_id = str((message.get("chat") or {}).get("id", ""))
+                if self.config.is_owner(chat_id):
+                    self.message_policy.record_incoming(
+                        chat_id, message.get("message_id")
+                    )
 
     def tick(self) -> None:
         events = []
@@ -168,34 +194,107 @@ class Runtime:
             print(f"Calendar: no pude leer el ICS: {exc}", flush=True)
 
         self.modules["vigia"].tick(events)
-        self.modules["guardian"].tick(events)
+        # Guardian se puede apagar solo, sin apagar el resto. Saltar su tick
+        # corta ráfagas, baja frecuencia y nuevas intervenciones de una vez.
+        # Sus eventos NO se tocan: siguen en su tabla, con su fase y su hora.
+        if not self.db.get_state(GUARDIAN_SUSPENDED_KEY, False):
+            self.modules["guardian"].tick(events)
         self.modules["pomodoro"].tick()
         self.modules["timer"].tick()
         self.modules["lite"].tick()
         self.modules["intervalos"].tick()
+        # Auditoría: deja por escrito qué decía la configuración cada día.
+        self.modules["system"].tick()
 
     def flush_outbox(self) -> None:
+        # Las pruebas y un eventual failover pueden reemplazar el adaptador
+        # despues del arranque. La politica siempre debe borrar por la misma
+        # puerta que acaba de enviar.
+        if self.message_policy.telegram is not self.telegram:
+            self.message_policy.bind(self.telegram)
+        self.message_policy.cleanup_legacy_orphans()
+        self._flush_pending_outbox()
+        try:
+            panel_created = self.message_policy.reconcile(
+                self.modules["panel"]
+            )
+        except Exception as exc:
+            print(f"[mensajes] no pude ordenar el chat: {exc}", flush=True)
+            return
+        if panel_created:
+            # La recreacion encola una sola pantalla. Se envia ahora para que
+            # el ciclo nunca termine con el panel todavia pendiente.
+            self._flush_pending_outbox()
+
+    def _flush_pending_outbox(self) -> None:
         for row in self.db.pending_outbox():
             try:
+                is_panel = self.db.get_state(PANEL_OUTBOX_KEY) == row["id"]
+                context = (
+                    self.message_policy.panel_send()
+                    if is_panel else nullcontext()
+                )
+                enviado = None
                 if row["kind"] == "photo" and row["photo_path"]:
-                    self.telegram.send_photo(
-                        row["chat_id"], row["photo_path"],
-                        row["text"] or "", row["parse_mode"],
-                    )
+                    with context:
+                        enviado = self.telegram.send_photo(
+                            row["chat_id"], row["photo_path"],
+                            row["text"] or "", row["parse_mode"],
+                        )
                     if row["delete_photo"]:
                         try:
                             Path(row["photo_path"]).unlink(missing_ok=True)
                         except OSError:
                             pass
+                elif row["kind"] == "delete" and row["message_id"]:
+                    self.telegram.delete_message(row["chat_id"], row["message_id"])
+                    self.message_policy.record_deleted(
+                        row["chat_id"], row["message_id"]
+                    )
                 elif row["kind"] == "edit" and row["message_id"]:
+                    buttons = _buttons(row["buttons"])
                     self.telegram.edit_message(
                         row["chat_id"], row["message_id"], row["text"] or "",
-                        _buttons(row["buttons"]), row["parse_mode"],
+                        buttons, row["parse_mode"],
+                    )
+                    self.message_policy.set_protected(
+                        row["chat_id"], row["message_id"],
+                        bool(row["retain_message"])
+                        or self.message_policy.protects_flow(buttons),
                     )
                 else:
-                    self.telegram.send_message(
-                        row["chat_id"], row["text"] or "",
-                        _buttons(row["buttons"]), row["parse_mode"],
+                    buttons = _buttons(row["buttons"])
+                    with context:
+                        # El panel se recrea abajo cada vez que algo lo deja
+                        # arriba, asi que cada aviso traia DOS notificaciones:
+                        # la del aviso y la del tablero cambiando de lugar. El
+                        # panel no da noticias, solo botones: llega callado.
+                        enviado = self.telegram.send_message(
+                            row["chat_id"], row["text"] or "",
+                            buttons, row["parse_mode"],
+                            disable_notification=is_panel,
+                        )
+                    self._anotar_panel(row["id"], enviado)
+                    self._anotar_efimero(row["id"], enviado)
+                    self.modules["guardian"].adopt_queue_anchor_message_id(
+                        row["id"], enviado
+                    )
+
+                # Los dobles de Telegram de las pruebas no tienen observer.
+                # El UPSERT hace que registrar tambien el cliente real sea
+                # inocuo y mantiene esta garantia comprobable sin red.
+                if enviado is not None:
+                    self.message_policy.record(
+                        row["chat_id"],
+                        self.message_policy._message_id(enviado),
+                        direction="outgoing",
+                        kind=row["kind"],
+                        is_panel=is_panel,
+                        protected=self.message_policy.protects_flow(
+                            _buttons(row["buttons"])
+                        ) or bool(row["retain_message"])
+                        or bool(row["flow_key"]),
+                        flow_key=row["flow_key"],
                     )
             except Exception as exc:
                 # Editar un mensaje con el mismo contenido devuelve error. No
@@ -208,6 +307,35 @@ class Runtime:
             else:
                 self.db.mark_outbox_sent(row["id"])
 
+    def _anotar_efimero(self, outbox_id, respuesta) -> None:
+        """Programa el borrado del mensaje que pidio irse solo."""
+        if self.db.get_state(EFIMERO_OUTBOX_KEY) != outbox_id:
+            return
+        destino = ((respuesta or {}).get("result") or {}).get("message_id")
+        with self.db.transaction():
+            self.db.set_state(EFIMERO_OUTBOX_KEY, None)
+        if destino:
+            self.message_policy.marcar_efimero(destino, EFIMERO_SEGUNDOS)
+
+    def _anotar_panel(self, outbox_id, respuesta) -> None:
+        """Le dice al Panel en que mensaje aterrizo su pantalla.
+
+        El `message_id` no existe hasta que Telegram acepta el envio, y el
+        Panel lo necesita para poder apagar esa pantalla cuando se mueva al
+        final de la conversacion. Solo se anota la fila que el Panel pidio
+        seguir: cualquier otro mensaje no le interesa.
+        """
+        if self.db.get_state(PANEL_OUTBOX_KEY) != outbox_id:
+            return
+        destino = ((respuesta or {}).get("result") or {}).get("message_id")
+        with self.db.transaction():
+            self.db.set_state(PANEL_MESSAGE_KEY, destino)
+            self.db.set_state(PANEL_OUTBOX_KEY, None)
+        if destino is not None:
+            self.modules["panel"].adopt_message_id(
+                self.config.owner_chat_id, destino
+            )
+
     def run_once(self) -> None:
         self.read_updates()
 
@@ -215,6 +343,7 @@ class Runtime:
         # esperar la respuesta de un /tm a que Google conteste es sumarle a
         # cada comando una demora que no tiene nada que ver con él.
         self.flush_outbox()
+        self.message_policy.borrar_efimeros()
 
         if not self.db.get_state(SUSPENDED_KEY, False):
             self.tick()
@@ -234,6 +363,7 @@ class Runtime:
                     with self.db.transaction():
                         self.modules["guardian"].cleanup_old_events()
                         self.db.purge_outbox()
+                        self.message_policy.purge()
                     last_cleanup = now_local()
 
             except KeyboardInterrupt:

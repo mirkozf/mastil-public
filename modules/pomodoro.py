@@ -19,6 +19,34 @@ from core.scheduler import (
 )
 
 
+# Descanso recomendado segun cuanto dura el bloque de trabajo.
+#
+# Es una TABLA, no una formula: se lee de un vistazo, se discute y se edita
+# a mano. No hay ninguna pretension de que estos numeros sean los correctos
+# para cualquiera — lo que esta respaldado es cortar los periodos largos, no
+# una cifra exacta por persona. Son el punto de partida de Mastil, y son una
+# sugerencia: nada obliga a tomarla.
+#
+# Cada par es (hasta_minutos_de_trabajo, minutos_de_descanso).
+DESCANSO_RECOMENDADO = ((25, 5), (45, 7), (60, 10), (90, 15))
+DESCANSO_TOPE = 15
+
+
+def descanso_recomendado(work_minutes: int) -> int:
+    """Minutos de descanso sugeridos para un bloque de `work_minutes`.
+
+    Por tramos y hacia arriba: un bloque de 30 cae en el tramo de 45 y
+    sugiere 7. De los dos errores posibles, descansar de mas es el barato.
+
+    Determinista y sin dependencias: ninguna IA interviene acá, igual que en
+    el resto de los tiempos del sistema.
+    """
+    for tope, descanso in DESCANSO_RECOMENDADO:
+        if work_minutes <= tope:
+            return descanso
+    return DESCANSO_TOPE
+
+
 class PomodoroModule:
     def __init__(self, config, db):
         self.config = config
@@ -127,6 +155,7 @@ class PomodoroModule:
                 cycle,
                 self.config.pomodoro_ciclos,
                 work_minutes,
+                descanso_recomendado(work_minutes),
             )
         )
 
@@ -202,9 +231,14 @@ class PomodoroModule:
             session = self._get()
         if not should_send(session["last_sent"], 60):
             return
+        trabajo = int(session["work_minutes"]
+                      or self.config.pomodoro_trabajo_minutes)
         with self.db.transaction():
             self._update(last_sent=iso(now_local()))
-            self._say(messages.POMODORO_CORTE)
+            self._say(
+                messages.POMODORO_CORTE + "\n\n"
+                + messages.pomodoro_sugerencia(descanso_recomendado(trabajo))
+            )
 
     def _send_return_check(self) -> None:
         with self.db.transaction():
@@ -264,7 +298,13 @@ class PomodoroModule:
         if phase == "work":
             etiqueta = "Trabajo profundo"
             restante = int(max(0, remaining_seconds(session["phase_until"])))
-            tiempo = f"Tiempo restante del bloque: {restante // 60:02d}:{restante % 60:02d}"
+            trabajo = int(session["work_minutes"]
+                          or self.config.pomodoro_trabajo_minutes)
+            tiempo = (
+                f"Tiempo restante del bloque: {restante // 60:02d}:{restante % 60:02d}"
+                "\n" + messages.pomodoro_sugerencia(
+                    descanso_recomendado(trabajo))
+            )
         elif phase == "cut_alert":
             etiqueta = "Alerta de Corte (Esperando inicio de descanso)"
             if int(session["cycle"] or 1) < self.config.pomodoro_ciclos:

@@ -141,8 +141,16 @@ class Vision:
         `messages` dentro de una integración.
         """
         # Sin `path` la llamada va sin imagen: avanzar por la estrategia ya
-        # conocida no necesita volver a mirar.
-        return self._call(prompt, [path] if path else [], context or {})
+        # conocida no necesita volver a mirar. Con una lista van todas en el
+        # MISMO request —`_call` arma una parte por imagen—, así que dos vistas
+        # del mismo lugar cuestan una sola llamada y una sola cuota.
+        if path is None:
+            rutas = []
+        elif isinstance(path, (list, tuple)):
+            rutas = [p for p in path if p]
+        else:
+            rutas = [path]
+        return self._call(prompt, rutas, context or {})
 
     def evaluar_texto(self, prompt: str) -> dict[str, Any]:
         """Una consulta sin imágenes, que devuelve texto libre.

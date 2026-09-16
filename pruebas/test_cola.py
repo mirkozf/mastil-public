@@ -4,7 +4,7 @@ import os, sys, dataclasses
 from pathlib import Path
 from datetime import datetime, timedelta
 
-RAIZ = str(Path(__file__).resolve().parent.parent)
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, RAIZ)
 os.environ.update(MASTIL_TELEGRAM_BOT_TOKEN="0:t", MASTIL_OWNER_CHAT_ID="999",
                   MASTIL_ICAL_URL="https://x.invalid/a.ics")
@@ -33,14 +33,20 @@ def ok(c, t):
     print(f"  {'ok  ' if c else 'MAL '} {t}")
     if not c: FALLAS += 1
 
+class PolicyFalsa:
+    """Doble de la politica de mensajes: anota que flujos mandaron retirar."""
+    def __init__(self): self.cerrados = []
+    def close_flow(self, flow_key=None): self.cerrados.append(flow_key)
+
+
 db = None
-def limpiar():
+def limpiar(policy=None):
     global db, RELOJ
     if db: db.close()
     TMP.unlink(missing_ok=True)
     RELOJ["t"] = BASE
     db = Database(cfg.db_path, cfg.schema_path); db.migrate()
-    return GuardianModule(cfg, db)
+    return GuardianModule(cfg, db, policy)
 
 def out():
     f = db.query("SELECT * FROM outbox WHERE sent_at IS NULL ORDER BY id")
@@ -81,7 +87,10 @@ ok(fase(g, "A") == "brake", "A sigue siendo el activo")
 ok(db.one("SELECT COUNT(*) c FROM guardian_events WHERE is_active=1")["c"] == 1,
    "un solo evento activo")
 t = out()
-ok(any("quedó pendiente" in x for x in t), "avisa que B quedo pendiente")
+anclas = db.query("SELECT * FROM outbox WHERE retain_message=1 ORDER BY id")
+ok(len(anclas) == 1 and "SIGUIENTE PENDIENTE" in anclas[0]["text"]
+   and "basura" in anclas[0]["text"],
+   "deja una tarjeta con B, no un aviso descartable")
 ok(not any(x == messages.GUARDIAN_ORIENTACION for x in t), "B NO disparo Guardian")
 
 print("\n=== 4. tres eventos conservan FIFO ===")
@@ -90,22 +99,33 @@ g.tick([ev("A", "uno")]); out()
 g.tick([ev("B", "dos")]); g.tick([ev("C", "tres")]); g.tick([ev("D", "cuatro")])
 ok(cola(g) == ["B", "C", "D"], f"orden FIFO {cola(g)}")
 
-print("\n=== 5. un solo aviso individual al entrar ===")
+print("\n=== 5. una sola tarjeta para toda la cola ===")
 out()
 for _ in range(5):
     g.tick([ev("A", "uno"), ev("B", "dos"), ev("C", "tres")])
 t = out()
-ok(sum("quedó pendiente" in x for x in t) == 0,
-   "no repite el aviso individual en ticks siguientes")
+ok(not t, "no repite mensajes: la tarjeta ya esta visible")
+anclas = db.query("SELECT * FROM outbox WHERE retain_message=1 ORDER BY id")
+texto = anclas[0]["text"] if anclas else ""
+ok(len(anclas) == 1 and "- <b>dos</b>" in texto
+   and "- tres" in texto and "- cuatro" in texto,
+   f"lista lo que espera, en orden, con la siguiente primero: {texto!r}")
 
-print("\n=== 6. mientras hay activo, el recordatorio es agregado ===")
+print("\n=== 6. mientras hay activo, la tarjeta vuelve a sonar cada 15 min ===")
+#
+# Editarla en su sitio no avisaba: una cola podia quedar muda arriba. Ahora se
+# vuelve a mandar abajo, una sola, con la lista al dia.
 avanzar(16)
 g.tick([])
 t = out()
-agregados = [x for x in t if "eventos pendientes" in x]
-ok(len(agregados) == 1, f"un solo mensaje agregado ({len(agregados)})")
-ok("3 eventos pendientes" in agregados[0], f"cuenta los 3: {agregados[0]}")
-ok(not any("«" in x for x in t), "no nombra evento por evento")
+tarjetas = [x for x in t if "SIGUIENTE PENDIENTE" in x]
+ok(len(tarjetas) == 1,
+   f"a los 15 minutos la tarjeta vuelve a mandarse, una sola ({len(tarjetas)})")
+ok(tarjetas and "- <b>dos</b>" in tarjetas[0], "con la lista completa")
+ok(not any("eventos pendientes" in x for x in t), "sin el viejo agregado aparte")
+g.tick([])
+ok(not any("SIGUIENTE PENDIENTE" in x for x in out()),
+   "y no se repite hasta el proximo intervalo")
 
 print("\n=== 7. cerrar el activo presenta el primer pendiente ===")
 # Escenario propio: sin avanzar el reloj, para que el activo siga en 'brake',
@@ -120,6 +140,8 @@ ok(fase(g, "B") == "decision", "B pasa a decision")
 ok(cola(g) == ["C", "D"], "y sale de la cola")
 t = out()
 ok(any(messages.COLA_DECISION_TITULO in x for x in t), "presenta la decision")
+fila = db.query("SELECT * FROM outbox WHERE retain_message=1 ORDER BY id")[-1]
+ok(fila["buttons"] is not None, "la decision sigue siendo una tarjeta protegida")
 ok(fase(g, "C") == "queued" and fase(g, "D") == "queued", "los otros siguen esperando")
 
 print("\n=== 7b. la hora mostrada es la original, no la de ahora ===")
@@ -187,6 +209,72 @@ ok(fase(g, "A") == "queued", "sigue pendiente, no se activo ni se borro")
 ok(not any(messages.COLA_DECISION_TITULO in x for x in out()), "no se repite enseguida")
 avanzar(16); g.tick([])
 ok(fase(g, "A") == "decision", "vuelve a ofrecerse a los ~15 min")
+out()
+
+print("\n=== 10c. el aviso de DESPUES no se lo lleva la ventana de tres ===")
+#
+# Paso en produccion: "vuelve al final de la cola" salia sin flujo, porque
+# `_despues` desactiva el evento ANTES de avisar y ahi ya no hay activo del que
+# heredar la clave. Sin flujo la politica de mensajes lo cuenta como charla
+# suelta y lo borra al cuarto mensaje, aunque el asunto siga abierto.
+g = limpiar()
+g.tick([ev("X", "activo")]); g.tick([ev("A", "pendiente")]); out()
+g.handle_command("/listo", "/listo"); g.tick([]); out()
+g.handle_cola_callback(cb("despues", "A"))
+
+filas = db.query("SELECT * FROM outbox WHERE sent_at IS NULL ORDER BY id")
+aviso = [f for f in filas if "vuelve al final" in (f["text"] or "")]
+ok(len(aviso) == 1, f"salio el aviso ({len(aviso)})")
+ok(aviso[0]["flow_key"], f"y va con flujo ({aviso[0]['flow_key']})")
+ok(aviso[0]["flow_key"] == GuardianModule._flow_key("A"),
+   "atado al evento que se aplazo, con la misma clave que usa el cierre")
+out()
+
+print("\n=== 10d. DESCARTAR sigue siendo un cierre, no un pendiente ===")
+#
+# Ahi no queda nada esperando: descartar ES la resolucion. Su aviso se comporta
+# como el de /listo y vive la vida normal de los tres.
+g = limpiar()
+g.tick([ev("X", "activo")]); g.tick([ev("A", "basura")]); out()
+g.handle_command("/listo", "/listo"); g.tick([]); out()
+g.handle_cola_callback(cb("descartar", "A"))
+
+filas = db.query("SELECT * FROM outbox WHERE sent_at IS NULL ORDER BY id")
+aviso = [f for f in filas if "descartado" in (f["text"] or "")]
+ok(len(aviso) == 1, f"salio el aviso de descarte ({len(aviso)})")
+ok(not aviso[0]["flow_key"], "y sin flujo: no deja nada pendiente en pantalla")
+out()
+
+print("\n=== 10e. aplazar dos veces no deja dos avisos iguales ===")
+#
+# Ahora que el aviso se queda en pantalla hasta que el evento se resuelva,
+# repetir DESPUES sobre el mismo evento apilaria copias de la misma linea. El
+# aviso nuevo se lleva al anterior: no dice nada que el nuevo no diga.
+pol = PolicyFalsa()
+g = limpiar(pol)
+
+
+def cerrados_de(eid):
+    # /listo sobre otro evento tambien cierra su flujo: se mira solo el de A.
+    return [k for k in pol.cerrados if k == GuardianModule._flow_key(eid)]
+
+
+g.tick([ev("X", "activo")]); g.tick([ev("A", "pendiente")]); out()
+g.handle_command("/listo", "/listo"); g.tick([]); out()
+
+g.handle_cola_callback(cb("despues", "A")); out()
+ok(len(cerrados_de("A")) == 1,
+   f"el primer aplazo ya retira lo que hubiera de A ({pol.cerrados})")
+
+avanzar(16); g.tick([]); out()
+g.handle_cola_callback(cb("despues", "A"))
+ok(len(cerrados_de("A")) == 2, f"y el segundo retira al primero ({pol.cerrados})")
+
+filas = db.query("SELECT * FROM outbox WHERE sent_at IS NULL ORDER BY id")
+avisos = [f for f in filas if "vuelve al final" in (f["text"] or "")]
+ok(len(avisos) == 1, f"pero el aviso nuevo sale igual ({len(avisos)})")
+ok(avisos[0]["flow_key"] == GuardianModule._flow_key("A"),
+   "y sigue atado a su evento")
 out()
 
 print("\n=== 11. DESCARTAR cierra explicitamente, sin borrar historial ===")
@@ -281,7 +369,8 @@ ok(any(messages.COLA_BOTON_EXPIRADO in x for x in out()), "avisa que el boton ex
 print("\n=== 20. Intervalos sin cambios ===")
 from modules.intervalos import MOMENTOS_AVISO, ESPERA_MINUTOS
 ok(MOMENTOS_AVISO == (0, 150, 180, 420), f"MOMENTOS_AVISO {MOMENTOS_AVISO}")
-ok(ESPERA_MINUTOS == 76, "ESPERA_MINUTOS 76")
+ok(isinstance(ESPERA_MINUTOS, int) and ESPERA_MINUTOS > 0,
+   f"ESPERA_MINUTOS lo fija el usuario a mano: {ESPERA_MINUTOS} min")
 ok(messages.INTERVALOS_AVISO == "⏱ Intervalo cumplido.", "su aviso intacto")
 
 db.close(); TMP.unlink(missing_ok=True)

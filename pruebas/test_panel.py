@@ -4,7 +4,7 @@ al mismo handler que los comandos y que no cambien nada de lo que ya había."""
 import os, sys, dataclasses
 from pathlib import Path
 
-RAIZ = str(Path(__file__).resolve().parent.parent)
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, RAIZ)
 os.environ.update(MASTIL_TELEGRAM_BOT_TOKEN="0:t", MASTIL_OWNER_CHAT_ID="999",
                   MASTIL_ICAL_URL="https://x.invalid/a.ics",
@@ -14,7 +14,7 @@ import config as cm
 import messages
 from database import Database
 from core.router import Router
-from modules.panel import PanelModule, MENUS
+from modules.panel import PanelModule, MENUS, MENUS
 
 YO, AJENO = "999", "555"
 TMP = Path(os.environ["TEMP"]) / "panel_test.db"
@@ -46,12 +46,15 @@ class Espia:
     `source_id` es opcional porque el de Calendar lo recibe y el resto no."""
     def __init__(self, dueño=()):
         self.visto = []; self.dueño = dueño; self.sorpresas = []
+
+    # Desde `ff1f2cb` el router lo llama en cada mensaje.
+    def abandon_contexto(self, *a, **k): pass
     def enviar_sorpresa(self, texto, foto=None):
         self.sorpresas.append((texto, foto)); return True
     def handle_command(self, command, raw_text, source_id=None):
         self.visto.append((command, raw_text))
         return command in self.dueño
-    def handle(self, command, source_id=None): self.visto.append((command, source_id)); return True
+    def handle(self, command, source_id=None, raw_text=""): self.visto.append((command, source_id)); return True
     def stop(self, *a, **k): pass
     def restore_calendar(self, *a, **k): pass
     def matches(self, *a, **k): return False
@@ -110,8 +113,9 @@ f = ultimo()
 ok(f is not None and f["text"] == "⚓ MÁSTIL", "titulo ⚓ MÁSTIL")
 ok(f["kind"] == "text", "el primero es mensaje nuevo, no edicion")
 esperados = ["panel:intervalos", "panel:calendar", "panel:timer",
-             "panel:pomodoro", "panel:gmail", "panel:system", "panel:vigia"]
-ok(datos_de(f) == esperados, f"los 7 modulos ({datos_de(f)})")
+             "panel:pomodoro", "panel:gmail", "panel:system",
+             "panel:vigia"]
+ok(datos_de(f) == esperados, f"los 7 accesos ({datos_de(f)})")
 ok(all(d not in datos_de(f) for d in ("/marca", "/tiempo", "/reset")),
    "marca/tiempo/reset NO estan en el panel principal")
 
@@ -124,7 +128,11 @@ for data, titulo in [("panel:intervalos", "⏱️ INTERVALOS"),
     r, mods, tg, panel = montar()
     r.process(cb(data))
     f = ultimo()
-    ok(f["text"] == titulo and f["kind"] == "edit" and f["message_id"] == 77,
+    # El de Pomodoro lleva ademas la duracion vigente y el descanso sugerido,
+    # asi que su titulo es el comienzo del texto y no el texto entero. El
+    # contenido dinamico lo cubre test_pomodoro_descanso.
+    ok(f["text"].startswith(titulo) and f["kind"] == "edit"
+       and f["message_id"] == 77,
        f"{data} -> {titulo} editando el mismo mensaje")
     ok("panel:home" in datos_de(f), f"   y tiene [🏠 PANEL]")
     ok(tg.answered == ["c1"], "   responde el callback (sin spinner)")
@@ -172,11 +180,10 @@ ok("/timer_cada 50 120" in datos_de(f),
    f"y los topes ya llevan el intervalo adentro ({datos_de(f)})")
 ok(not any(d.startswith("/timer_cada 50") and len(d.split()) == 2
            for d in datos_de(f)), "ninguna salida crea un repetitivo sin tope")
-r.process(cb("panel:tm:hora"))
-ok("panel:tm:hora:pedir" in datos_de(ultimo()), "avisar a pide elegir la hora")
 outbox()
-r.process(cb("panel:tm:hora:pedir"))
-ok("hora" in (ultimo()["text"] or "").lower(), "y pregunta cual")
+r.process(cb("panel:tm:hora"))
+ok("Pon la hora" in (ultimo()["text"] or ""),
+   "avisar a pide la hora directo, sin pantalla intermedia")
 r.process(msg("21:40"))
 visto = mods["timer"].visto
 ok(visto and visto[0][1] == "/timer_a 21:40",
@@ -207,7 +214,13 @@ for etiqueta, data, comando in [("📍 MARCA", "/marca", "/marca"),
     r.process(cb(data))
     ok(mods["intervalos"].visto and mods["intervalos"].visto[0][0] == comando,
        f"{etiqueta} -> intervalos.handle({comando})")
-    ok(not outbox(), "   el panel no genero mensaje propio")
+    # El panel ya no se queda callado: se reubica al final de la
+    # conversacion. Lo que se sigue cuidando es que NO conteste el
+    # comando — eso es del modulo, no suyo.
+    titulos = {t for t, _ in MENUS.values()}
+    propios = [f["text"] or "" for f in outbox()]
+    ok(all(t == messages.PANEL_APAGADO or t in titulos for t in propios),
+       "   el panel solo se reubica, no contesta el comando")
 
 print("\n=== 6. RESET pide confirmacion ===")
 r, mods, tg, panel = montar()
@@ -347,7 +360,8 @@ ok(all(f["kind"] == "edit" and f["message_id"] == 77 for f in filas),
 print("\n=== 18. no toque Intervalos ===")
 from modules.intervalos import MOMENTOS_AVISO, ESPERA_MINUTOS
 ok(MOMENTOS_AVISO == (0, 150, 180, 420), f"MOMENTOS_AVISO intacto {MOMENTOS_AVISO}")
-ok(ESPERA_MINUTOS == 76, "ESPERA_MINUTOS intacto")
+ok(isinstance(ESPERA_MINUTOS, int) and ESPERA_MINUTOS > 0,
+   f"ESPERA_MINUTOS lo fija el usuario a mano: {ESPERA_MINUTOS} min")
 ok(messages.INTERVALOS_AVISO == "⏱ Intervalo cumplido.", "su aviso intacto")
 
 db.close(); cfg.db_path.unlink(missing_ok=True)

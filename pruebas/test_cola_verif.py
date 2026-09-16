@@ -4,7 +4,7 @@ import os, sys, dataclasses
 from pathlib import Path
 from datetime import datetime, timedelta
 
-RAIZ = str(Path(__file__).resolve().parent.parent)
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, RAIZ)
 os.environ.update(MASTIL_TELEGRAM_BOT_TOKEN="0:t", MASTIL_OWNER_CHAT_ID="999",
                   MASTIL_ICAL_URL="https://x.invalid/a.ics")
@@ -317,7 +317,7 @@ ok(filas("B") == 1 and filas("C") == 1, "y nada se borro")
 
 
 # =========================================================================
-print("\n=== 11. un solo ciclo agregado ===")
+print("\n=== 11. una sola tarjeta de cola ===")
 g = limpiar()
 EVS = [ics("A", "activo", a_las(18, 0)), ics("B", "b", a_las(18, 1)),
        ics("C", "c", a_las(18, 2)), ics("D", "d", a_las(18, 3))]
@@ -326,15 +326,22 @@ for i in range(1, 4):
     poner(a_las(18, i)); g.tick(EVS[:i + 1])
 out()
 avanzar(16); g.tick(EVS)
-agregados = [x for x in out() if "eventos pendientes" in x]
-ok(len(agregados) == 1 and "3 eventos" in agregados[0], f"un ciclo, 3 eventos: {agregados}")
+salida = [x for x in out() if "SIGUIENTE PENDIENTE" in x]
+ok(len(salida) == 1, f"a los 15 minutos la tarjeta vuelve a bajar, una ({len(salida)})")
+anclas = db.query("SELECT text FROM outbox WHERE retain_message=1 ORDER BY id DESC LIMIT 1")
+texto = anclas[0]["text"] if anclas else ""
+ok("- <b>b</b>" in texto and "- c" in texto and "- d" in texto,
+   f"una tarjeta, siguiente b y el resto listado: {texto!r}")
 
 EV_E = ics("E", "e", RELOJ["t"])
 g.tick(EVS + [EV_E]); out()
 avanzar(16); g.tick(EVS + [EV_E])
-agregados = [x for x in out() if "eventos pendientes" in x]
-ok(len(agregados) == 1, f"sigue habiendo UN solo ciclo ({len(agregados)})")
-ok("4 eventos" in agregados[0], f"y refleja la cantidad correcta: {agregados[0]}")
+salida = [x for x in out() if "SIGUIENTE PENDIENTE" in x]
+ok(len(salida) == 1, f"vuelve a bajar una sola vez, no una por evento ({len(salida)})")
+anclas = db.query("SELECT text FROM outbox WHERE retain_message=1 ORDER BY id DESC LIMIT 1")
+texto = anclas[0]["text"] if anclas else ""
+ok("- <b>b</b>" in texto and all(f"- {x}" in texto for x in ("c", "d", "e")),
+   f"la tarjeta lista los cuatro pendientes: {texto!r}")
 
 
 # =========================================================================
@@ -347,7 +354,8 @@ ok(not any("eventos pendientes" in x for x in t), "y no manda el agregado en el 
 ok(db.get_state(G.COLA_AVISO_KEY) is None, "el ciclo agregado quedo apagado")
 for _ in range(20):
     avanzar(1); g.tick(EVS + [EV_E])
-    ok_agg = [x for x in out() if "eventos pendientes" in x]
+    salida = out()
+    ok_agg = [x for x in salida if "eventos pendientes" in x]
     if ok_agg:
         ok(False, f"el agregado revivio sin activo: {ok_agg}")
         break
@@ -428,7 +436,9 @@ ok(any(messages.COLA_BOTON_EXPIRADO in x for x in out()), "  avisa que expiro")
 print("\n=== 17. Intervalos sin tocar ===")
 from modules.intervalos import MOMENTOS_AVISO, ESPERA_MINUTOS, HORAS_CIERRE, MAX_FILAS
 ok(MOMENTOS_AVISO == (0, 150, 180, 420), f"MOMENTOS_AVISO {MOMENTOS_AVISO}")
-ok(ESPERA_MINUTOS == 76 and HORAS_CIERRE == 4 and MAX_FILAS == 10, "constantes intactas")
+ok(HORAS_CIERRE == 4 and MAX_FILAS == 10, "constantes intactas")
+ok(isinstance(ESPERA_MINUTOS, int) and ESPERA_MINUTOS > 0,
+   f"ESPERA_MINUTOS lo fija el usuario a mano: {ESPERA_MINUTOS} min")
 ok(messages.INTERVALOS_AVISO == "⏱ Intervalo cumplido.", "aviso intacto")
 ok(messages.INTERVALOS_TITULO and messages.INTERVALOS_SIN_MARCAS, "textos presentes")
 

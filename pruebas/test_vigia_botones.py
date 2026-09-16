@@ -1,13 +1,13 @@
 """Cada paso del diagrama de Vigia, por boton. Nada obliga a escribir comandos."""
 import os, sys, dataclasses, json
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.update(MASTIL_TELEGRAM_BOT_TOKEN="0:t", MASTIL_OWNER_CHAT_ID="999",
                   MASTIL_ICAL_URL="https://x.invalid/a.ics")
 import config as cm, messages
 from database import Database
 from core.router import Router
-from modules.vigia import VigiaModule
+from modules.vigia import VigiaModule, _leer_fotos
 from modules.panel import PanelModule
 
 YO = "999"
@@ -108,7 +108,11 @@ ok(ctx["alcance"] == "toda la cocina" and ctx["restricciones"] == "no tirar nada
 
 print("\n=== FOTO ===")
 r.process(cb("panel:vig:foto")); f = out()[-1]
-ok("Manda la foto" in (f["text"] or ""), "dice que mande la foto")
+ok("Cuántas fotos" in (f["text"] or ""), "primero pregunta cuantas van a venir")
+ok(btns(f) == ["panel:vig:foto:1", "panel:vig:foto:2", "panel:vig:ctx",
+               "panel:home"], f"una, dos, volver o panel ({btns(f)})")
+r.process(cb("panel:vig:foto:1")); f = out()[-1]
+ok("Manda la foto" in (f["text"] or ""), "elegir UNA pide la foto de siempre")
 ok(btns(f) == ["panel:vig:ctx", "panel:home"], f"y deja volver al contexto ({btns(f)})")
 vis.r.append(PLAN); r.process(foto(3, "a"))
 p = vis.prompts[-1]
@@ -127,8 +131,9 @@ directos()
 r.process(cb("/vigia_bloque_ok"))
 ok(any("foto del estado actual" in t for t, _ in tg.directos), "pide la foto, directo")
 ok(ses()["bloque"] == antes, "y NO avanza el bloque por si solo")
-ok(btn_directo() == ["/vigia_siguiente", "/vigia_trabado", "panel:home"],
-   f"salidas ({btn_directo()})")
+ok(btn_directo() == ["/vigia_siguiente", "panel:vig:foto:2",
+                     "/vigia_trabado", "panel:home"],
+   f"salidas, con la opcion de dos fotos ({btn_directo()})")
 directos(); out()
 
 print("\n=== ME TRABÉ ===")
@@ -148,7 +153,8 @@ ok("DATOS INSUFICIENTES" in (f["text"] or ""), "avisa que faltan datos")
 ok("La caja del rincón" in (f["text"] or ""), "con la pregunta concreta")
 ok(btns(f) == ["panel:vig:aclarar", "/vigia_otra_foto", "panel:home"],
    f"RESPONDER / OTRA FOTO / PANEL ({btns(f)})")
-ok(ses()["ultima_foto"].endswith("b.jpg"), "guarda la foto para reanalizarla")
+ok(_leer_fotos(ses()["ultima_foto"])[-1].endswith("b.jpg"),
+   "guarda la foto para reanalizarla")
 ok(ses()["bloque"] == antes, "y no pierde el bloque")
 llamadas = len(vis.prompts)
 r.process(cb("panel:vig:aclarar")); out()
@@ -186,9 +192,9 @@ print("\n=== la foto final es registro: se guarda y cierra, sin modelo ===")
 r.process(cb("/vigia_registrar")); f = out()[-1]
 ok("resultado final" in (f["text"] or "").lower(), "pide la foto del resultado")
 llamadas_reg = len(vis.prompts)
-r.process(foto(8, "e")); f = out()[-1]
+r.process(foto(8, "e")); cierre = out()
 ok(len(vis.prompts) == llamadas_reg, "NO pasa por el modelo")
-ok("Resultado registrado" in (f["text"] or ""), "avisa que quedo registrado")
+ok(not cierre, "no deja un mensaje histórico tras registrar")
 ok(ses()["active"] == 0, "y cierra la sesion")
 fin = db.one("SELECT * FROM vigia_evidence ORDER BY id DESC LIMIT 1")
 ok(fin["stage"] == "final" and fin["decision"] == "REGISTRO",
@@ -198,7 +204,9 @@ print("\n=== NINGÚN mensaje de Vigía queda sin botones ===")
 r.process(cb("panel:vig:ctx")); f = out()[-1]
 ok(messages.PANEL_VIG_SIN_TAREA in (f["text"] or ""), "sin tarea, el contexto lo dice")
 ok(bool(btns(f)), "y trae botones")
-r.process(cb("/vigia_bloque_ok")); f = out()[-1]
+# El panel se reubica al final de la conversacion, asi que el aviso de
+# Vigia ya no es el ultimo mensaje de la tanda: es el primero.
+r.process(cb("/vigia_bloque_ok")); f = out()[0]
 ok(btns(f) == ["panel:home"], "sin tarea, RECALIBRAR avisa con salida")
 directos()
 r.process(cb("/vigia_trabado")); f = out()[-1]
@@ -206,12 +214,14 @@ ok(btns(f) == ["panel:home"], "ME TRABÉ igual")
 r.process(msg("/vigia", 8)); f = out()[-1]
 ok(btns(f) == ["panel:home"], "el uso tambien")
 r.process(msg("/vigia otra tarea", 9)); f = out()[-1]
-ok(btns(f) == ["panel:vig:ctx", "panel:home"], f"al crear, ofrece contexto ({btns(f)})")
+ok(btns(f) == ["panel:vig:ctx", "panel:vig:foto:2", "panel:home"],
+   f"al crear, ofrece contexto y las dos fotos ({btns(f)})")
 r.process(cb("panel:vigia")); out()
 r.process(cb("panel:vig:cancelar")); out()
 r.process(cb("panel:vig:cancelar:ok"))
 fs = out()
-ok(any(btns(x) == ["panel:home"] for x in fs if x["buttons"]), "cancelar tambien")
+ok(any("panel:vig:objetivo" in btns(x) for x in fs if x["buttons"]),
+   "cancelar vuelve al submenu sin dejar un cierre histórico")
 ok(ses()["active"] == 0, "y cierra")
 
 
@@ -225,7 +235,8 @@ f = out()[-1]
 ok("No pude analizar" in (f["text"] or ""), "avisa el fallo")
 ok(btns(f) == ["/vigia_reintentar", "/vigia_siguiente", "/vigia_trabado", "panel:home"],
    f"REINTENTAR / ME TRABÉ / PANEL ({btns(f)})")
-ok(ses()["ultima_foto"].endswith("w.jpg"), "guarda la foto fallida para reintentar")
+ok(_leer_fotos(ses()["ultima_foto"])[-1].endswith("w.jpg"),
+   "guarda la foto fallida para reintentar")
 ok(ses()["bloque"] == bloque_previo, "y no pierde el bloque")
 vis.r.append(PLAN)
 r.process(cb("/vigia_reintentar"))
@@ -255,9 +266,9 @@ ok("LA PERSONA DICE QUE SE TRABÓ: sí" in vis.prompts[-1],
    "el modelo se entera de que estaba trabado")
 
 print("\n=== CERRAR sin foto final tambien termina la tarea ===")
-r.process(cb("/vigia_cerrar")); f = out()[-1]
+r.process(cb("/vigia_cerrar")); cierre = out()
 ok(ses()["active"] == 0, "cierra sin pedir nada")
-ok(messages.VIGIA_CERRADO in (f["text"] or ""), "y lo dice")
+ok(not cierre, "y no deja un mensaje histórico")
 
 print("\n=== la regla del plan ya no depende solo de la foto ===")
 ok("el objetivo, el contexto, las restricciones" in messages.VIGIA_PROMPT_PLAN,

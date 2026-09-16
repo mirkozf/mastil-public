@@ -20,16 +20,14 @@ from __future__ import annotations
 
 from typing import Any
 
-
 class Router:
     def __init__(self, config, db, telegram, modules: dict[str, Any]):
         self.config = config
         self.db = db
         self.telegram = telegram
         self.modules = modules
-
         # Orden de la cadena de comandos. El primero que devuelve True gana.
-        self.command_chain = [
+        self.command_chain = [m for m in (
             modules["panel"],
             # Vigía atiende /vigia y sus comandos. Antes no estaba en la
             # cadena, así que /vigia_cancelar y /vigia_stop no llegaban a
@@ -40,7 +38,7 @@ class Router:
             modules["pomodoro"],
             modules["gmail"],
             modules["guardian"],
-        ]
+        ) if m is not None]
 
     # ------------------------------------------------------------ updates
 
@@ -61,6 +59,17 @@ class Router:
         )
         data = str(callback.get("data") or "").strip()
 
+        # Única excepción no-owner: los dos botones de una pregunta enviada
+        # a la usuaria asistida. Panel valida id, chat, usuario y message_id contra SQLite.
+        if data.startswith("asistq:"):
+            print(f"[router] assisted question callback={data}", flush=True)
+            try:
+                self.modules["panel"].handle_assisted_question_callback(callback)
+            except Exception as exc:
+                print(f"[router] Pregunta la usuaria asistida: {exc}", flush=True)
+                self.telegram.answer_callback(callback.get("id", ""))
+            return
+
         if not self.config.is_owner(chat_id) or not data:
             self.telegram.answer_callback(callback.get("id", ""))
             return
@@ -77,8 +86,9 @@ class Router:
             return
 
         # El Panel navega editando el mensaje, así que necesita el callback
-        # entero (de dónde viene y qué mensaje reemplazar). Se le responde
-        # primero para que el botón no quede girando mientras navega.
+        # entero (de dónde viene y qué mensaje reemplazar). El acuse se pone
+        # primero en la cola no bloqueante de Telegram: el botón deja de girar
+        # sin retrasar la edición visible del menú.
         if data.startswith("panel:"):
             self.telegram.answer_callback(callback.get("id", ""))
             print(f"[router] panel callback={data}", flush=True)
@@ -91,6 +101,15 @@ class Router:
         self.telegram.answer_callback(callback.get("id", ""))
         print(f"[router] callback={data}", flush=True)
         self.handle_command(data, callback.get("id"))
+
+        # El panel siempre vive en el ultimo mensaje. La accion ya contesto
+        # abajo; ahora el menu que la disparo se apaga y vuelve a dibujarse
+        # al final. Va despues del comando a proposito: asi su mensaje entra
+        # en la outbox despues de la respuesta y queda al pie.
+        try:
+            self.modules["panel"].reubicar(callback)
+        except Exception as exc:
+            print(f"[router] panel reubicar: {exc}", flush=True)
 
     def _process_message(self, message: dict[str, Any]) -> None:
         chat_id = str((message.get("chat") or {}).get("id", ""))
@@ -120,6 +139,7 @@ class Router:
         if text.startswith("/"):
             print(f"[router] command={text}", flush=True)
             self.modules["panel"].olvidar_todo()
+            self.modules["intervalos"].abandon_contexto()
             self.handle_command(text, message.get("message_id"))
             return
 
@@ -164,11 +184,17 @@ class Router:
         if text:
             if self.modules["vigia"].handle_text(text):
                 return
+            if self.modules["intervalos"].handle_text(text):
+                return
             self.modules["guardian"].handle_text(text)
 
     # ----------------------------------------------------------- comandos
 
     def handle_command(self, raw_text: str, source_id: object = None) -> None:
+        """Despacha el comando; cada módulo cierra únicamente su propio flujo."""
+        self._despachar(raw_text, source_id)
+
+    def _despachar(self, raw_text: str, source_id: object = None) -> None:
         raw_text = raw_text.strip()
         if not raw_text:
             return
@@ -178,13 +204,11 @@ class Router:
         # Intervalos necesita saber de qué mensaje viene para no registrar dos
         # marcas si Telegram reintenta la entrega.
         if command in (
-            "/marca", "/tiempo", "/reset",
-            # Los dos botones de la fricción de /tiempo. Van por acá y no por
-            # la cadena porque Intervalos no está en ella.
-            "/tiempo_mostrar", "/tiempo_dejarlo",
+            "/marca", "/marca_contexto", "/contexto", "/tiempo", "/reset",
+            "/borrar_marca",
         ):
             try:
-                self.modules["intervalos"].handle(command, source_id)
+                self.modules["intervalos"].handle(command, source_id, raw_text)
             except Exception as exc:
                 print(f"[router] Intervalos: {exc}", flush=True)
             return

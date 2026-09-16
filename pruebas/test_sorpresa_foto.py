@@ -2,7 +2,7 @@
 import os, sys, dataclasses, json
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.update(MASTIL_TELEGRAM_BOT_TOKEN="0:t", MASTIL_OWNER_CHAT_ID="999",
                   MASTIL_ICAL_URL="https://x.invalid/a.ics")
 import config as cm, messages
@@ -48,7 +48,7 @@ def montar(fallar_envio=False):
     cfg = dataclasses.replace(
         cm.load(), owner_chat_id=YO, db_path=TMP, evidence_dir=F,
         lite_users=(LiteUser(ELLA, "Asistida", "America/Santiago"),
-                    LiteUser(YO, "Titular", "America/Santiago")),
+                    LiteUser(YO, "Propietario", "America/Santiago")),
     )
     db = Database(cfg.db_path, cfg.schema_path); db.migrate()
     tg = TG()
@@ -84,7 +84,8 @@ montar()
 r.process(cb("panel:sys:sorpresa"))
 f = ultimo()
 ok(messages.PANEL_SORPRESA_MENU in (f["text"] or ""), "muestra el menu")
-ok(etiq(f) == ["📸 CON FOTO", "💬 SIN FOTO", "❌ CANCELAR"], f"tres opciones ({etiq(f)})")
+ok(etiq(f) == ["📸 CON FOTO", "💬 SIN FOTO", "❓ PREGUNTA ASISTIDA", "❌ CANCELAR"],
+   f"sorpresas conserva sus opciones y suma pregunta ({etiq(f)})")
 ok(not tg.textos and not tg.fotos, "no manda nada todavia")
 
 print("\n=== 2/3. SIN FOTO: texto -> preview ===")

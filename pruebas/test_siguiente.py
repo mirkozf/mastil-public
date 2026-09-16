@@ -3,7 +3,7 @@ Ademas: limite de Gmail por opcion."""
 import os, sys, dataclasses, json
 from pathlib import Path
 from datetime import datetime, timedelta
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.update(MASTIL_TELEGRAM_BOT_TOKEN="0:t", MASTIL_OWNER_CHAT_ID="999",
                   MASTIL_ICAL_URL="https://x.invalid/a.ics")
 import config as cm, messages
@@ -12,6 +12,11 @@ from database import Database
 from core.router import Router
 from modules.vigia import VigiaModule
 from modules.gmail import GmailModule, CONTADOR_KEY
+
+# Esta suite prueba la FRICCION COMPLETA, que hoy no es el modo por
+# defecto (ver FRICCION_COMPLETA en modules/gmail.py). Se declara acá para
+# que siga cubierta pase lo que pase con el interruptor.
+G.FRICCION_COMPLETA = True
 from modules.panel import PanelModule
 
 BASE = datetime.now().astimezone().replace(hour=10, minute=0, second=0, microsecond=0)
@@ -128,8 +133,9 @@ def usos(cmd):
     if e.get("fecha") != ahora().strftime("%Y-%m-%d"): return 0
     return int((e.get("usos", {}).get(cmd) or {}).get("n", 0))
 
-r.process(msg("/gmail_hay", 20)); out()
-r.process(msg("/gmail_hay", 21)); out()
+# Con cupo cada revision se confirma: un toque sin querer no la gasta.
+r.process(msg("/gmail_hay", 20)); out(); r.process(cb("/gmail_igual")); out()
+r.process(msg("/gmail_hay", 21)); out(); r.process(cb("/gmail_igual")); out()
 ok(usos("/gmail_hay") == 2, "hay: 2/2")
 ok(usos("/gmail_remitentes") == 0, "remitentes sigue en 0/2")
 
@@ -138,10 +144,11 @@ r.process(msg("/gmail_hay", 22)); f = out()[-1]
 ok("¿hay correos?" in (f["text"] or ""), f"hay agotado, y dice cual ({f['text'][:60]})")
 ok(len(puente.llamadas) == llamadas, "no consulto")
 
-r.process(msg("/gmail_remitentes", 23))
+r.process(msg("/gmail_remitentes", 23)); out()
+r.process(cb("/gmail_igual"))
 ok(any("Remitentes" in (x["text"] or "") for x in out()), "remitentes SI funciona")
 ok(usos("/gmail_remitentes") == 1, "y cuenta aparte (1/2)")
-r.process(msg("/gmail_remitentes", 24)); out()
+r.process(msg("/gmail_remitentes", 24)); out(); r.process(cb("/gmail_igual")); out()
 ok(usos("/gmail_remitentes") == 2, "2/2")
 
 print("\n=== y el contenido queda accesible ===")

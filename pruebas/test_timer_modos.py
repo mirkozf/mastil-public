@@ -5,7 +5,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-RAIZ = str(Path(__file__).resolve().parent.parent)
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, RAIZ)
 os.environ.update(MASTIL_TELEGRAM_BOT_TOKEN="0:t", MASTIL_OWNER_CHAT_ID="999",
                   MASTIL_ICAL_URL="https://x.invalid/a.ics")
@@ -81,7 +81,7 @@ print("\n=== 4-5. countdown llega a cero y suena ===")
 avanzar(minutes=29); t.tick()
 ok(not out(), "a los 29 no suena")
 avanzar(minutes=1); t.tick()
-ok("Timer terminado" in out(), "a los 30 suena")
+ok("Timer de 30 minutos terminado" in out(), "a los 30 suena y dice de cuanto era")
 ok(fila()["status"] == "ringing", "queda sonando, como siempre")
 cmd(t, "/apagar")
 ok(fila()["active"] == 0, "y /apagar lo deja sin timer activo")
@@ -227,7 +227,8 @@ t2 = TimerModule(cfg, db)          # instancia nueva, misma base
 ok(sched.from_iso(fila()["ends_at"]) == BASE + timedelta(minutes=40),
    "countdown recupera su hora objetivo")
 avanzar(minutes=40); t2.tick()
-ok("Timer terminado" in out(), "y suena cuando corresponde")
+ok("Timer de 40 minutos terminado" in out(),
+   "y suena cuando corresponde, con su duracion")
 ok(db.one("SELECT COUNT(*) c FROM timer")["c"] == 1, "sin duplicar timers")
 
 t = limpiar()
@@ -288,7 +289,8 @@ ok(all(l.strip().startswith("#") or not l.strip() for l in req.splitlines()),
    "requirements.txt sigue sin dependencias")
 import modules.guardian as G, modules.intervalos as I
 ok(G.RAFAGA_MENSAJES == 7 and G.INTERVENCION_MINUTOS == 70, "Guardian sin cambios")
-ok(I.ESPERA_MINUTOS == 76, "Intervalos sin cambios")
+ok(isinstance(I.ESPERA_MINUTOS, int) and I.ESPERA_MINUTOS > 0,
+   f"ESPERA_MINUTOS lo fija el usuario a mano: {I.ESPERA_MINUTOS} min")
 ok(hasattr(T.TimerModule, "pause") and hasattr(T.TimerModule, "resume"),
    "pausa y reanudacion siguen existiendo")
 

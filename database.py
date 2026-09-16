@@ -58,6 +58,14 @@ class Database:
         )
         # Algunos flujos editan un mismo mensaje en vez de encadenar varios.
         self._ensure_column("outbox", "message_id", "INTEGER")
+        # Mensajes de estado excepcionales, como la siguiente tarea de
+        # Guardian, sobreviven a la limpieza visual mientras sigan vigentes.
+        self._ensure_column(
+            "outbox", "retain_message", "INTEGER NOT NULL DEFAULT 0"
+        )
+        # Identidad explícita del flujo temporal al que pertenece el mensaje.
+        # No guarda el título: sólo módulo + id técnico del evento o sesión.
+        self._ensure_column("outbox", "flow_key", "TEXT")
         # Aviso al cumplirse el intervalo, con su escalamiento.
         # Guardian escala en exigencia: guarda cuándo toca el próximo paso
         # (a una hora al azar, no fija) y el código que cierra el nivel 2.
@@ -97,8 +105,29 @@ class Database:
         self._ensure_column("vigia_session", "declarados", "TEXT")
         # Qué vio el modelo la última vez, para poder marcarle lo nuevo.
         self._ensure_column("vigia_session", "contexto_analizado", "TEXT")
+        # Un escenario caótico se lee mejor desde dos ángulos. El análisis se
+        # dispara al llegar la foto, así que hay que saber ANTES si viene una
+        # sola o si conviene esperar a la segunda.
+        self._ensure_column(
+            "vigia_session", "fotos_esperadas", "INTEGER NOT NULL DEFAULT 1"
+        )
+        self._ensure_column("vigia_session", "foto_previa", "TEXT")
         self._ensure_column("interval_marks", "alerts_sent", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("interval_marks", "alert_ack", "INTEGER NOT NULL DEFAULT 0")
+        # Contexto voluntario de una marca. Es nullable para no tocar las
+        # marcas históricas ni obligar a explicar cada registro.
+        self._ensure_column("interval_marks", "context_category", "TEXT")
+        self._ensure_column("interval_marks", "context_text", "TEXT")
+        self._ensure_column(
+            "telegram_messages", "protected", "INTEGER NOT NULL DEFAULT 0"
+        )
+        self._ensure_column("telegram_messages", "flow_key", "TEXT")
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_telegram_messages_flow
+            ON telegram_messages(chat_id, flow_key, deleted_at)
+            """
+        )
 
         # Filas únicas de los módulos con una sola sesión a la vez.
         for table in ("pomodoro_session", "timer", "vigia_session"):
@@ -201,6 +230,8 @@ class Database:
         send_after: datetime | None = None,
         delete_photo: bool = False,
         message_id: int | None = None,
+        retain_message: bool = False,
+        flow_key: str | None = None,
     ) -> int:
         """Deja un mensaje listo para enviar. NO envía.
 
@@ -222,8 +253,9 @@ class Database:
             """
             INSERT INTO outbox
                 (chat_id, kind, text, buttons, message_id, photo_path,
-                 parse_mode, delete_photo, send_after, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 parse_mode, delete_photo, retain_message, flow_key,
+                 send_after, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(chat_id),
@@ -234,9 +266,22 @@ class Database:
                 photo_path,
                 parse_mode,
                 1 if delete_photo else 0,
+                1 if retain_message else 0,
+                str(flow_key) if flow_key else None,
                 send_after.astimezone().isoformat() if send_after else None,
                 _now_iso(),
             ),
+        )
+        return int(cursor.lastrowid)
+
+    def enqueue_delete(self, chat_id: str, message_id: int) -> int:
+        """Pide borrar un mensaje por la outbox, nunca desde un módulo."""
+        cursor = self.execute(
+            """
+            INSERT INTO outbox(chat_id, kind, message_id, created_at)
+            VALUES (?, 'delete', ?, ?)
+            """,
+            (str(chat_id), int(message_id), _now_iso()),
         )
         return int(cursor.lastrowid)
 

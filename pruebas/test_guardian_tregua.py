@@ -4,7 +4,7 @@ import os, sys, dataclasses, json
 from pathlib import Path
 from datetime import datetime, timedelta
 
-RAIZ = str(Path(__file__).resolve().parent.parent)
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, RAIZ)
 os.environ.update(MASTIL_TELEGRAM_BOT_TOKEN="0:t", MASTIL_OWNER_CHAT_ID="999",
                   MASTIL_ICAL_URL="https://x.invalid/a.ics")
@@ -304,7 +304,13 @@ ok(len(fs) == G.RAFAGA_MENSAJES, "rafaga de siempre")
 avanzar(6); g.tick([])
 ok(len(out()) == G.RAFAGA_MENSAJES, "y la siguiente igual")
 g.handle_command("/listo", "/listo")
-ok(any(x in messages.MENSAJES_CIERRE for x in out()), "/listo cierra con su medalla")
+# El cierre ahora dice primero QUE se cerro y la medalla va debajo, en el
+# mismo mensaje: diez minutos despues el chat tiene que decir que quedo hecho.
+salida = out()
+ok(any(m in x for x in salida for m in messages.MENSAJES_CIERRE),
+   "/listo cierra con su medalla")
+ok(any(x.startswith("✅ Cerrado:") for x in salida),
+   "y nombra la tarea que se cerro")
 ok(fila_evento("A")["phase"] == "done", "y queda done")
 
 db.close()

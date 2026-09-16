@@ -13,9 +13,12 @@ lo decide `core/router.py`, explícitamente.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
+import queue
 import struct
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,6 +27,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 API_ROOT = "https://api.telegram.org"
+API_HOST = "api.telegram.org"
 
 
 class TelegramError(RuntimeError):
@@ -54,14 +58,109 @@ class Telegram:
     def __init__(self, token: str, timeout: int = 20):
         self.token = token
         self.timeout = timeout
+        self._message_observer = None
+        # Confirmar un botón no cambia ningún estado ni produce contenido.
+        # Hacer esa llamada en el hilo principal agregaba una ida y vuelta
+        # completa antes de empezar siquiera a editar el menú. Una cola
+        # acotada y un único worker conservan el orden de los acuses sin
+        # bloquear la respuesta visible del panel.
+        self._callback_answers: queue.Queue[dict[str, Any]] = queue.Queue(
+            maxsize=64
+        )
+        self._callback_worker: threading.Thread | None = None
+        self._callback_worker_lock = threading.Lock()
+        # Conexion reutilizable POR HILO.
+        #
+        # Abrir el canal contra Telegram cuesta ~115 ms de saludo (TCP mas
+        # TLS) antes de mandar un solo byte util, y `urlopen` lo reabre en
+        # cada llamada. Reusarla ahorra esos 115 ms en todas menos la
+        # primera: es la mitad del tiempo de una transicion de menu.
+        #
+        # Por hilo y no compartida: el worker de los acuses corre en otro
+        # hilo, y dos hilos sobre una misma conexion HTTP se pisan las
+        # respuestas entre si.
+        #
+        # El long polling NO la usa (ver `get_updates`): se queda colgado
+        # hasta un minuto esperando, y compartirla dejaria cada boton
+        # esperando a que ese poll termine — peor que no reusar nada.
+        self._local = threading.local()
+
+    def set_message_observer(self, observer) -> None:
+        """Observa envios aceptados sin acoplar los modulos a la politica."""
+        self._message_observer = observer
+
+    def _observe(self, chat_id: object, response: dict[str, Any], kind: str) -> None:
+        if self._message_observer:
+            self._message_observer(chat_id, response, kind)
 
     # ------------------------------------------------------------- básicos
 
     def _url(self, method: str) -> str:
         return f"{API_ROOT}/bot{self.token}/{method}"
 
-    def api(self, method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _ruta(self, method: str) -> str:
+        return f"/bot{self.token}/{method}"
+
+    def _conexion(self) -> http.client.HTTPSConnection:
+        """La conexion de ESTE hilo. Se abre la primera vez y se conserva."""
+        conexion = getattr(self._local, "conexion", None)
+        if conexion is None:
+            conexion = http.client.HTTPSConnection(
+                API_HOST, timeout=self.timeout)
+            self._local.conexion = conexion
+        return conexion
+
+    def _soltar_conexion(self) -> None:
+        """Descarta la conexion de este hilo. La proxima llamada abre otra."""
+        conexion = getattr(self._local, "conexion", None)
+        self._local.conexion = None
+        if conexion is not None:
+            try:
+                conexion.close()
+            except Exception:
+                pass
+
+    def api(self, method: str, payload: dict[str, Any] | None = None,
+            reusar: bool = True) -> dict[str, Any]:
+        """Llama a la API.
+
+        Con `reusar` en False va por una conexion suelta: es lo que hace el
+        long polling, que no puede ocupar la compartida.
+        """
         data = urllib.parse.urlencode(payload).encode("utf-8") if payload else None
+        if not reusar:
+            return self._api_suelta(method, data)
+
+        try:
+            return self._api_reusando(method, data)
+        except TelegramError:
+            # Telegram contesto y rechazo: no es la conexion, es la
+            # peticion. Reintentarla seria mandar dos veces lo mismo.
+            raise
+        except Exception as exc:
+            # El otro lado pudo cerrar la conexion mientras estaba ociosa.
+            # Se descarta y se reintenta UNA vez por la via de siempre: un
+            # mensaje no se pierde por reusar el canal.
+            print(f"[telegram] reabro la conexion tras {exc}", flush=True)
+            self._soltar_conexion()
+            return self._api_suelta(method, data)
+
+    def _api_reusando(self, method: str, data) -> dict[str, Any]:
+        conexion = self._conexion()
+        conexion.request(
+            "POST", self._ruta(method), body=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        respuesta = conexion.getresponse()
+        cuerpo = respuesta.read()
+        if respuesta.status >= 400:
+            detalle = cuerpo.decode("utf-8", errors="replace")
+            raise TelegramError(
+                f"{method} HTTP {respuesta.status}: {detalle[:400]}")
+        return json.loads(cuerpo.decode("utf-8"))
+
+    def _api_suelta(self, method: str, data) -> dict[str, Any]:
+        """Una conexion nueva, como se hacia siempre."""
         request = urllib.request.Request(self._url(method), data=data, method="POST")
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
@@ -73,7 +172,11 @@ class Telegram:
     # ------------------------------------------------------------- updates
 
     def get_updates(self, offset: int, timeout: int = 1) -> list[dict[str, Any]]:
-        result = self.api("getUpdates", {"offset": offset, "timeout": timeout})
+        # Por conexion suelta a proposito: este poll se queda colgado hasta
+        # que llega algo, y ocupar la conexion compartida dejaria cualquier
+        # boton esperando a que termine.
+        result = self.api("getUpdates", {"offset": offset, "timeout": timeout},
+                          reusar=False)
         return result.get("result", []) or []
 
     def drain_updates(self) -> int:
@@ -93,16 +196,49 @@ class Telegram:
         text: str = "",
         show_alert: bool = False,
     ) -> None:
+        if not callback_id:
+            return
         payload: dict[str, Any] = {"callback_query_id": callback_id}
         if text:
             payload["text"] = text
         if show_alert:
             payload["show_alert"] = "true"
+
+        self._ensure_callback_worker()
         try:
-            self.api("answerCallbackQuery", payload)
-        except Exception:
-            # Un callback sin confirmar deja el botón girando, nada más.
+            self._callback_answers.put_nowait(payload)
+        except queue.Full:
+            # Sólo puede ocurrir después de decenas de pulsaciones todavía
+            # pendientes. El acuse es efímero: nunca debe frenar los mensajes
+            # ni desplazar una acción real de la outbox.
             pass
+
+    def _ensure_callback_worker(self) -> None:
+        worker = self._callback_worker
+        if worker and worker.is_alive():
+            return
+        with self._callback_worker_lock:
+            worker = self._callback_worker
+            if worker and worker.is_alive():
+                return
+            self._callback_worker = threading.Thread(
+                target=self._answer_callbacks,
+                name="mastil-telegram-callbacks",
+                daemon=True,
+            )
+            self._callback_worker.start()
+
+    def _answer_callbacks(self) -> None:
+        while True:
+            payload = self._callback_answers.get()
+            try:
+                self.api("answerCallbackQuery", payload)
+            except Exception:
+                # Un callback sin confirmar deja el botón girando, nada más.
+                # El menú y su acción siguen por la vía durable normal.
+                pass
+            finally:
+                self._callback_answers.task_done()
 
     # -------------------------------------------------------------- envío
 
@@ -112,14 +248,25 @@ class Telegram:
         text: str,
         buttons: Sequence[tuple[str, str]] | None = None,
         parse_mode: str | None = None,
+        disable_notification: bool = False,
     ) -> dict[str, Any]:
+        """Un mensaje al chat.
+
+        `disable_notification` lo entrega sin sonido ni vibración: llega y se
+        ve igual, pero no interrumpe. Es para lo que no trae noticia, como el
+        panel, que sólo cambia de lugar.
+        """
         payload: dict[str, Any] = {"chat_id": str(chat_id), "text": text}
         if parse_mode:
             payload["parse_mode"] = parse_mode
+        if disable_notification:
+            payload["disable_notification"] = True
         teclado = _keyboard(buttons)
         if teclado:
             payload["reply_markup"] = teclado
-        return self.api("sendMessage", payload)
+        response = self.api("sendMessage", payload)
+        self._observe(chat_id, response, "text")
+        return response
 
     def edit_message(
         self,
@@ -132,7 +279,7 @@ class Telegram:
         """Reemplaza el contenido de un mensaje ya enviado.
 
         Sirve para que un flujo entero ocurra sobre un único mensaje en
-        vez de encadenar seis. En un momento de impulso, una pantalla que se
+        vez de encadenar seis. En un flujo largo, una pantalla que se
         llena de mensajes es ruido; uno solo que va cambiando, no.
         """
         payload: dict[str, Any] = {
@@ -201,7 +348,9 @@ class Telegram:
 
         try:
             with urllib.request.urlopen(request, timeout=25) as response:
-                return json.loads(response.read().decode("utf-8"))
+                result = json.loads(response.read().decode("utf-8"))
+            self._observe(chat_id, result, "photo")
+            return result
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             raise TelegramError(f"sendPhoto HTTP {exc.code}: {detail[:400]}") from exc
@@ -255,10 +404,31 @@ class Telegram:
 
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
-                return json.loads(response.read().decode("utf-8"))
+                result = json.loads(response.read().decode("utf-8"))
+            self._observe(chat_id, result, "document")
+            return result
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             raise TelegramError(f"sendDocument HTTP {exc.code}: {detail[:400]}") from exc
+
+    # -------------------------------------------------------------- borrado
+
+    def delete_message(self, chat_id: str, message_id: int) -> dict[str, Any]:
+        return self.api(
+            "deleteMessage",
+            {"chat_id": str(chat_id), "message_id": int(message_id)},
+        )
+
+    def delete_messages(
+        self, chat_id: str, message_ids: Sequence[int]
+    ) -> dict[str, Any]:
+        ids = [int(message_id) for message_id in message_ids]
+        if not ids:
+            return {"ok": True, "result": True}
+        return self.api(
+            "deleteMessages",
+            {"chat_id": str(chat_id), "message_ids": json.dumps(ids)},
+        )
 
     # ---------------------------------------------------------- descargas
 

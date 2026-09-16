@@ -1,13 +1,13 @@
 """Los cuatro bugs del flujo SIGUIENTE / RECALIBRAR. Regresion permanente."""
 import os, sys, dataclasses, json
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.update(MASTIL_TELEGRAM_BOT_TOKEN="0:t", MASTIL_OWNER_CHAT_ID="999",
                   MASTIL_ICAL_URL="https://x.invalid/a.ics")
 import config as cm, messages
 from database import Database
 from core.router import Router
-from modules.vigia import VigiaModule
+from modules.vigia import VigiaModule, _leer_fotos
 from modules.panel import PanelModule
 
 YO = "999"
@@ -96,7 +96,8 @@ filas = out()
 ok(any("No pude analizar" in (x["text"] or "") for x in filas), "avisa el fallo")
 f = [x for x in filas if x["buttons"]][-1]
 ok(btns(f)[0] == "/vigia_reintentar", f"REINTENTAR reanaliza esa foto ({btns(f)})")
-ok(ses()["ultima_foto"].endswith("b.jpg"), "que quedo guardada")
+ok(_leer_fotos(ses()["ultima_foto"])[-1].endswith("b.jpg"),
+   "que quedo guardada")
 limpiar_todo()
 
 db.close(); TMP.unlink(missing_ok=True)

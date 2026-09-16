@@ -83,6 +83,28 @@ def _leer_lista(crudo) -> list:
     return datos if isinstance(datos, list) else []
 
 
+def _guardar_fotos(rutas) -> str:
+    """Las fotos de este análisis, para poder repetirlo sin pedir otra."""
+    return json.dumps([str(r) for r in rutas])
+
+
+def _leer_fotos(crudo) -> list:
+    """Las fotos guardadas, en lista.
+
+    Acepta el formato viejo —una ruta suelta— porque una sesión abierta al
+    momento de actualizar tiene ahí una cadena, no un JSON.
+    """
+    if not crudo:
+        return []
+    try:
+        datos = json.loads(crudo)
+    except (TypeError, ValueError):
+        return [str(crudo)]
+    if isinstance(datos, list):
+        return [str(d) for d in datos if d]
+    return [str(crudo)]
+
+
 def _contexto_nuevo(session) -> dict:
     """Los campos del contexto que cambiaron desde la última foto analizada.
 
@@ -145,10 +167,14 @@ class Session:
     ultima_foto: str = ""
     declarados: list = None
     contexto_analizado: dict = None
+    # Cuántas fotos se acordó mandar, y la primera si todavía falta la otra.
+    fotos_esperadas: int = 1
+    foto_previa: str = ""
 
 
 class VigiaModule:
-    def __init__(self, config, db, telegram, vision, privacy):
+    def __init__(self, config, db, telegram, vision, privacy,
+                 message_policy=None):
         self.config = config
         self.db = db
         self.telegram = telegram
@@ -157,6 +183,7 @@ class VigiaModule:
         # ofusca el calendario: una sesión puede durar días, y dejar los
         # títulos ofuscados días es exactamente el incidente que no se repite.
         self.privacy = privacy
+        self.message_policy = message_policy
 
     # ---------------------------------------------------------------- datos
 
@@ -178,12 +205,27 @@ class VigiaModule:
             ultima_foto=row["ultima_foto"] or "",
             declarados=_leer_lista(row["declarados"]),
             contexto_analizado=_leer_contexto(row["contexto_analizado"]),
+            fotos_esperadas=int(row["fotos_esperadas"] or 1),
+            foto_previa=row["foto_previa"] or "",
         )
 
     # --------------------------------------------------- contexto (lo usa Panel)
 
     def sesion_activa(self):
         return self._session()
+
+    def esperar_fotos(self, cuantas: int) -> bool:
+        """Cuántas fotos vienen para el próximo análisis. La usa el Panel.
+
+        Elegir de nuevo descarta la que estuviera a medio camino: si volviste a
+        la pregunta, la tanda anterior ya no era la que querías mandar.
+        """
+        if not self._session():
+            return False
+        with self.db.transaction():
+            self._update(fotos_esperadas=2 if int(cuantas or 1) >= 2 else 1,
+                         foto_previa=None)
+        return True
 
     def contexto_actual(self) -> dict:
         session = self._session()
@@ -218,8 +260,19 @@ class VigiaModule:
         )
 
     def _say(self, text: str, buttons=None) -> None:
+        session = self._session()
         self.db.enqueue(self.config.owner_chat_id, text,
-                        buttons=buttons, parse_mode="HTML")
+                        buttons=buttons, parse_mode="HTML",
+                        flow_key=(self._flow_key(session.event_id)
+                                  if session else None))
+
+    @staticmethod
+    def _flow_key(event_id: str) -> str:
+        return f"vigia:{event_id}"
+
+    def _close_message_flow(self, event_id: str) -> None:
+        if self.message_policy:
+            self.message_policy.close_flow(self._flow_key(event_id))
 
     def _cuota_diaria(self, reason: str = "") -> int:
         """El límite que reporta el propio 429, o el último que se vio."""
@@ -247,9 +300,20 @@ class VigiaModule:
         mensaje juntos.
         """
         try:
-            self.telegram.send_message(
+            response = self.telegram.send_message(
                 self.config.owner_chat_id, text, buttons, "HTML"
             )
+            session = self._session()
+            if session and self.message_policy:
+                self.message_policy.record(
+                    self.config.owner_chat_id,
+                    self.message_policy._message_id(response),
+                    direction="outgoing",
+                    kind="text",
+                    is_panel=False,
+                    protected=True,
+                    flow_key=self._flow_key(session.event_id),
+                )
         except Exception as exc:
             print(f"[vigia] envío directo falló: {exc}", flush=True)
             with self.db.transaction():
@@ -483,8 +547,8 @@ class VigiaModule:
                 "VALUES (?, ?)",
                 (session.event_id, iso(now_local())),
             )
+            self._close_message_flow(session.event_id)
             self._close()
-            self._say(texto, buttons=messages.VIGIA_BOTONES_CIERRE)
             self.db.audit("vigia", "cerrado", reason)
         return True
 
@@ -500,8 +564,8 @@ class VigiaModule:
                 "VALUES (?, ?)",
                 (session.event_id, iso(now_local())),
             )
+            self._close_message_flow(session.event_id)
             self._close()
-            self._say(messages.VIGIA_CANCELADO, buttons=messages.VIGIA_BOTONES_CIERRE)
             self.db.audit("vigia", "cancelado", reason)
 
     # ----------------------------------------------------------------- texto
@@ -561,16 +625,40 @@ class VigiaModule:
             self._registrar_final(session, ruta)
             return True
 
-        self._analizar(session, ruta)
+        # Se acordaron dos y ésta es la primera: se guarda y se espera. Analizar
+        # ahora sería planificar con media escena, que es justo lo que la
+        # segunda foto viene a evitar.
+        if session.fotos_esperadas >= 2 and not session.foto_previa:
+            with self.db.transaction():
+                self._update(foto_previa=str(ruta))
+                self._say(messages.VIGIA_PRIMERA_RECIBIDA)
+            return True
+
+        rutas = [session.foto_previa, ruta] if session.foto_previa else [ruta]
+        # La tanda se cierra acá: la próxima foto vuelve a empezar de cero.
+        with self.db.transaction():
+            self._update(fotos_esperadas=1, foto_previa=None)
+
+        self._analizar(session, rutas)
         return True
 
     def _analizar(self, session: Session, ruta) -> None:
-        """Foto + objetivo + plan vigente -> plan completo de lo que queda.
+        """Foto(s) + objetivo + plan vigente -> plan completo de lo que queda.
 
         Es la única llamada al modelo que queda. Devuelve la lista entera de
         bloques restantes, ya redactados, y el primero es el de ahora. Avanzar
         por esa lista después no cuesta nada.
+
+        `ruta` acepta una foto o una lista de ellas. Dos vistas del mismo lugar
+        viajan en el MISMO request, así que cuestan una sola consulta: lo que
+        cambia es cuánto de la escena alcanza a ver el modelo.
         """
+        rutas = list(ruta) if isinstance(ruta, (list, tuple)) else [ruta]
+        rutas = [Path(r) for r in rutas if r]
+        # El registro de evidencia sigue siendo de una: la última, que es la
+        # vista más reciente del entorno.
+        ruta = rutas[-1] if rutas else None
+
         if self._cuota_restante():
             with self.db.transaction():
                 self._say(messages.vigia_cuota(self._cuota_diaria()),
@@ -586,12 +674,13 @@ class VigiaModule:
             bloque=session.bloque or "(todavía no hay bloque asignado)",
             trabado="sí" if session.trabado else "no",
             declarados=messages.vigia_declarados(session.declarados or []),
+            fotos=messages.vigia_nota_fotos(len(rutas)),
         )
 
         resultado = {}
         if self.vision and self.vision.enabled:
             try:
-                resultado = self.vision.planificar(ruta, prompt) or {}
+                resultado = self.vision.planificar(rutas, prompt) or {}
             except Exception as exc:
                 print(f"[vigia] análisis fallido: {exc}", flush=True)
 
@@ -607,7 +696,7 @@ class VigiaModule:
             pregunta = str(resultado.get("pregunta") or "").strip()
             if pregunta:
                 with self.db.transaction():
-                    self._update(ultima_foto=str(ruta))
+                    self._update(ultima_foto=_guardar_fotos(rutas))
                     self._say(messages.vigia_falta_contexto(pregunta),
                               buttons=messages.VIGIA_BOTONES_FALTA)
                     self.db.audit("vigia", "falta_contexto")
@@ -621,7 +710,7 @@ class VigiaModule:
             print(f"[vigia] sin plan: {razon}", flush=True)
             cuota = _espera_de_cuota(razon)
             with self.db.transaction():
-                self._update(ultima_foto=str(ruta))
+                self._update(ultima_foto=_guardar_fotos(rutas))
                 if cuota:
                     # Es una cuota DIARIA: la ventana corta sólo evita que un
                     # reintento inmediato gaste otra consulta al pedo.
@@ -668,7 +757,7 @@ class VigiaModule:
                 stage=TRABAJANDO, bloque=plan[0], trabado=0,
                 estrategia=json.dumps(plan, ensure_ascii=False),
                 declarados=json.dumps([], ensure_ascii=False),
-                ultima_foto=str(ruta),
+                ultima_foto=_guardar_fotos(rutas),
             )
             if not session.bloque:
                 campos["start_photo_ref"] = str(ruta)
@@ -700,15 +789,18 @@ class VigiaModule:
                 self._say(messages.VIGIA_OTRA_FOTO,
                           buttons=messages.VIGIA_BOTONES_ESPERA)
             return True
-        ruta = Path(session.ultima_foto)
-        if not ruta.exists():
+        # Vuelven TODAS las de la última tanda: si mandaste dos ángulos, el
+        # reanálisis se hace con los dos. Repetirlo con la mitad de la escena
+        # sería perder justo lo que la segunda foto vino a aportar.
+        rutas = [Path(p) for p in _leer_fotos(session.ultima_foto)]
+        if not rutas or not all(r.exists() for r in rutas):
             with self.db.transaction():
                 self._say(messages.VIGIA_OTRA_FOTO,
                           buttons=messages.VIGIA_BOTONES_ESPERA)
             return True
         if not self._cuota_restante():
             self._directo(messages.VIGIA_PENSANDO)
-        self._analizar(session, ruta)
+        self._analizar(session, rutas)
         return True
 
     def _completar(self, session: Session) -> None:

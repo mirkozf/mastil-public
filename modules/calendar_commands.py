@@ -16,7 +16,22 @@ import messages
 
 
 DEFAULT_DURATION_MINUTES = 30
+
+# Cuántas veces se relee el día para confirmar un evento. Google entrega la
+# respuesta de Apps Script en un segundo paso que a veces contesta 404 aunque
+# el script ya corrió; el siguiente intento suele entrar. Dos, no más: cada
+# 404 puede tardar medio minuto y el ciclo de Mástil espera.
+RELECTURAS = 2
 TIME_PATTERN = re.compile(r"^\d{2}:\d{2}$")
+
+# Reloj de 12 con sufijo opcional pegado o separado: `9`, `1:30`, `9:30 a`,
+# `9p`. El sufijo es la unica forma de no tener que preguntar.
+HORA_PATTERN = re.compile(r"^(\d{1,2})(?::(\d{2}))?\s*(am|pm|a|p)?$", re.I)
+
+ESTADO_OK = "ok"
+ESTADO_AMBIGUA = "ambigua"
+ESTADO_SIN_CERO = "sin_cero"
+ESTADO_INVALIDA = "invalida"
 DATE_PATTERN = re.compile(r"^\d{2}/\d{2}$")
 DATE_LIKE_PATTERN = re.compile(r"^\d{1,2}[-/]\d{1,2}$")
 
@@ -32,13 +47,80 @@ class CalendarRequest:
     end_at: datetime
 
 
+def franja_de(texto: str) -> str | None:
+    """`a`/`am` -> "a"; `p`/`pm` -> "p". Cualquier otra cosa, None."""
+    limpio = (texto or "").strip().lower()
+    if limpio in ("a", "am"):
+        return "a"
+    if limpio in ("p", "pm"):
+        return "p"
+    return None
+
+
+def aplicar_franja(hora: int, minuto: int, franja: str):
+    """Pasa una hora de reloj de 12 a 24. Las 12 a son las 00."""
+    h = hora % 12
+    return (h + 12 if franja == "p" else h), minuto
+
+
+def token_hora(hora: int, minuto: int) -> str:
+    """La hora en 12h con sufijo, en UN solo token: `9:30a`.
+
+    Un token y no dos porque `/cal` separa por espacios y toma el ultimo
+    como la hora: un sufijo suelto se leeria como parte del titulo.
+    """
+    # De 13 en adelante no hace falta sufijo: ya es inequivoca, y reescribirla
+    # cambiaria por nada lo que se venia mandando.
+    if hora >= 13:
+        return f"{hora:02d}:{minuto:02d}"
+    sufijo = "a" if hora < 12 else "p"
+    return f"{hora % 12 or 12}:{minuto:02d}{sufijo}"
+
+
+def interpretar_hora(value: str):
+    """(estado, hora, minuto) en formato de 24 horas.
+
+    Con `ambigua`, hora y minuto vuelven tal como se escribieron: falta
+    saber la franja para poder convertirlos.
+
+    El cero no se usa: la medianoche se escribe `12 a`. Tener dos formas de
+    decir lo mismo es justo lo que obliga a pensar antes de escribir.
+    """
+    match = HORA_PATTERN.fullmatch((value or "").strip().lower())
+    if not match:
+        return ESTADO_INVALIDA, 0, 0
+
+    hora = int(match.group(1))
+    minuto = int(match.group(2) or 0)
+    if minuto > 59:
+        return ESTADO_INVALIDA, 0, 0
+
+    sufijo = match.group(3)
+    if sufijo:
+        if not 1 <= hora <= 12:
+            return ESTADO_INVALIDA, 0, 0
+        hora, minuto = aplicar_franja(hora, minuto, franja_de(sufijo))
+        return ESTADO_OK, hora, minuto
+
+    if hora == 0:
+        return ESTADO_SIN_CERO, 0, 0
+    if hora > 23:
+        return ESTADO_INVALIDA, 0, 0
+    # De 13 a 23 no hay nada que preguntar: no pueden ser de la mañana.
+    if hora >= 13:
+        return ESTADO_OK, hora, minuto
+    return ESTADO_AMBIGUA, hora, minuto
+
+
 def _parse_time(value: str) -> time:
-    if not TIME_PATTERN.fullmatch(value):
-        raise CalendarCommandError(messages.CALENDAR_ERROR_TIME)
-    hour, minute = (int(part) for part in value.split(":"))
-    if hour > 23 or minute > 59:
-        raise CalendarCommandError(messages.CALENDAR_ERROR_TIME)
-    return time(hour, minute)
+    estado, hora, minuto = interpretar_hora(value)
+    if estado == ESTADO_OK:
+        return time(hora, minuto)
+    if estado == ESTADO_SIN_CERO:
+        raise CalendarCommandError(messages.CALENDAR_ERROR_MEDIANOCHE)
+    if estado == ESTADO_AMBIGUA:
+        raise CalendarCommandError(messages.CALENDAR_ERROR_AMPM)
+    raise CalendarCommandError(messages.CALENDAR_ERROR_TIME)
 
 
 def _parse_date(value: str, year: int) -> date:
@@ -123,6 +205,8 @@ class CalendarCommandsModule:
                 (request_id, self.bridge.now().isoformat()),
             )
 
+        dia = request.start_at.astimezone(self.bridge.tz).strftime("%Y-%m-%d")
+        event_id = None
         try:
             result = self.bridge.create_event(
                 title=request.title,
@@ -132,44 +216,43 @@ class CalendarCommandsModule:
             )
             event_id = str(result["event"]["id"])
         except Exception as exc:
+            # Un fallo acá no prueba que no se creó: Apps Script responde en un
+            # segundo paso que Google a veces contesta 404 con el evento ya
+            # hecho (12 de 13 "fallidos" de septiembre estaban en el
+            # calendario). Se decide releyendo, igual que un éxito.
             print(f"[calendar] crear evento: {exc}", flush=True)
-            with self.db.transaction():
-                self.db.execute(
-                    """
-                    UPDATE calendar_command_requests
-                    SET status = 'failed', last_error = ?
-                    WHERE request_id = ?
-                    """,
-                    (str(exc)[:500], request_id),
-                )
-                self._say(messages.CALENDAR_CREATE_FAILED)
-            return True
 
-        # Que el puente conteste "ok" no prueba que el evento exista. Antes de
-        # confirmar, lo releemos del calendario. Si no está donde debería, no
-        # se confirma: un aviso de "creado" que no es cierto vale menos que
-        # ninguno, porque después no revisás.
-        dia = request.start_at.astimezone(self.bridge.tz).strftime("%Y-%m-%d")
-        try:
-            visto = self.bridge.find_event(event_id, dia)
-        except Exception as exc:
-            # Creado pero sin poder comprobarlo: ni éxito ni fallo. Se dice.
-            print(f"[calendar] no pude verificar el evento: {exc}", flush=True)
+        # Que el puente conteste "ok" tampoco prueba que el evento exista. En
+        # los dos casos la única prueba es verlo: por su id si llegó, y por la
+        # marca de este pedido si se perdió. Un aviso de "creado" que no es
+        # cierto vale menos que ninguno, porque después no revisás.
+        visto, error = self._releer(dia, request_id, event_id)
+
+        if visto is None and error is not None:
+            # Ni releyendo se pudo mirar: no es éxito ni fallo. Se dice.
+            if event_id:
+                estado, detalle = "created", f"sin verificar: {str(error)[:400]}"
+            else:
+                estado, detalle = "failed", f"sin confirmar: {str(error)[:400]}"
             with self.db.transaction():
                 self.db.execute(
                     """
                     UPDATE calendar_command_requests
-                    SET status = 'created', calendar_event_id = ?, created_at = ?,
+                    SET status = ?, calendar_event_id = ?, created_at = ?,
                         last_error = ?
                     WHERE request_id = ?
                     """,
-                    (event_id, self.bridge.now().isoformat(),
-                     f"sin verificar: {str(exc)[:400]}", request_id),
+                    (estado, event_id,
+                     self.bridge.now().isoformat() if event_id else None,
+                     detalle, request_id),
                 )
                 self.db.enqueue(self.config.owner_chat_id,
                                 messages.CALENDAR_UNVERIFIED, parse_mode="HTML")
-                self.db.audit("calendar", "create_unverified", event_id)
+                self.db.audit("calendar", "create_unverified", event_id or "sin id")
             return True
+
+        if visto is not None:
+            event_id = str(visto.get("id") or event_id)
 
         if visto is None:
             with self.db.transaction():
@@ -183,7 +266,7 @@ class CalendarCommandsModule:
                 )
                 self.db.enqueue(self.config.owner_chat_id,
                                 messages.CALENDAR_CREATE_FAILED, parse_mode="HTML")
-                self.db.audit("calendar", "create_no_visible", event_id)
+                self.db.audit("calendar", "create_no_visible", event_id or "sin id")
             return True
 
         with self.db.transaction():
@@ -207,6 +290,22 @@ class CalendarCommandsModule:
             )
             self.db.audit("calendar", "create_event", event_id)
         return True
+
+    def _releer(self, dia: str, request_id: str, event_id: str | None):
+        """Busca el evento en su día, por id o por marca, hasta RELECTURAS veces.
+
+        (evento, None) si está; (None, None) si el día se leyó y no está;
+        (None, error) si ningún intento pudo leerlo.
+        """
+        error = None
+        for _ in range(RELECTURAS):
+            try:
+                return self.bridge.find_event(event_id, dia,
+                                              request_id=request_id), None
+            except Exception as exc:
+                error = exc
+                print(f"[calendar] no pude releer el día: {exc}", flush=True)
+        return None, error
 
     def _request_id(self, source_id: object, raw_text: str) -> str:
         if source_id is not None:

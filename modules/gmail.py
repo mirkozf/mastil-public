@@ -46,6 +46,32 @@ FRICCION = ("/gmail_igual", "/gmail_dejarlo", "/gmail_si", "/gmail_reintentar")
 #   {"fecha": "YYYY-MM-DD", "usos": {"/gmail_hay": {"n": 1, "ultima": iso}}}
 CONTADOR_KEY = "gmail_revisiones"
 
+# Los motivos escritos, para que la evaluación de hoy vea los de antes.
+#
+# El contador dice CUÁNTAS veces se revisó; esto dice CON QUÉ se justificó, que
+# es lo único capaz de mostrar cuándo la fricción se volvió trámite. No va a la
+# auditoría: `Database.audit` es registro de qué pasó, nunca contenido.
+#
+# En `system_state`, sin tabla nueva, y acotado a los últimos MOTIVOS_MAX para
+# que la lista no crezca sin techo:
+#   [{"cuando": iso, "comando": "/gmail_hay", "motivo": "texto"}, ...]
+MOTIVOS_KEY = "gmail_motivos"
+MOTIVOS_MAX = 30
+
+# ---------------------------------------------------- modo de fricción
+#
+# El interruptor entre las dos maneras de revisar el correo:
+#
+#   True  — la fricción de siempre: tope diario, motivo escrito y
+#           evaluación del modelo antes de abrir el buzón.
+#   False — una sola confirmación y nada más. Para las temporadas en las
+#           que hay que revisar de verdad y seguido, donde la fricción
+#           completa estorba más de lo que ayuda.
+#
+# Cambiar esta línea es lo único que hace falta. Los dos flujos están
+# enteros y las dos rutas cubiertas por las pruebas.
+FRICCION_COMPLETA = True
+
 
 class GmailModule:
     def __init__(self, config, db, bridge, telegram=None, vision=None):
@@ -107,6 +133,29 @@ class GmailModule:
     def _agotado(self, command: str) -> bool:
         return int(self._uso(command).get("n", 0)) >= messages.GMAIL_LIMITE_DIARIO
 
+    def _motivos(self) -> list:
+        """Los motivos guardados, del más antiguo al más reciente."""
+        guardado = self.db.get_state(MOTIVOS_KEY)
+        return guardado if isinstance(guardado, list) else []
+
+    def _anotar_motivo(self, command: str, motivo: str) -> None:
+        """Guarda un motivo escrito y descarta los que sobran del techo.
+
+        Se anota aunque después desista: lo que interesa es qué se dijo a sí
+        mismo, no si llegó a abrir el buzón.
+        """
+        motivo = (motivo or "").strip()
+        if not motivo:
+            return
+        historial = self._motivos()
+        historial.append({
+            "cuando": now_local().isoformat(),
+            "comando": command,
+            "motivo": motivo[:300],
+        })
+        with self.db.transaction():
+            self.db.set_state(MOTIVOS_KEY, historial[-MOTIVOS_MAX:])
+
     # ------------------------------------------------------------ comandos
 
     def handle_command(self, command: str, raw_text: str) -> bool:
@@ -121,14 +170,41 @@ class GmailModule:
         if command in FRICCION:
             return self._friccion_paso(command)
 
+        # Modo simple: una sola pregunta, sin mirar el contador.
+        if command in REVISIONES and not FRICCION_COMPLETA:
+            self._friccion = {"comando": command, "paso": "simple",
+                              "motivo": None}
+            self._say(messages.GMAIL_CONFIRMA_SIMPLE,
+                      buttons=messages.GMAIL_BOTONES_SIMPLE)
+            return True
+
         # Mirar el buzón con las revisiones agotadas abre la fricción en vez
         # de la consulta. Abrir un correo concreto no pasa por acá.
         if command in REVISIONES and self._agotado(command):
-            self._friccion = {"comando": command, "paso": "limite", "motivo": None}
-            self._say(messages.gmail_limite_alcanzado(command),
-                      buttons=messages.GMAIL_BOTONES_LIMITE)
+            return self._abrir_limite(command)
+
+        # Con cupo también se confirma: un toque sin querer en el menú no
+        # debería gastar una revisión del día, y ver cuántas quedan deja ver
+        # el precio antes de pagarlo. Los botones son los del modo simple.
+        if command in REVISIONES:
+            quedan = messages.GMAIL_LIMITE_DIARIO - int(self._uso(command).get("n", 0))
+            self._friccion = {"comando": command, "paso": "disponible",
+                              "motivo": None}
+            self._say(messages.gmail_confirma_disponible(command, quedan),
+                      buttons=messages.GMAIL_BOTONES_SIMPLE)
             return True
 
+        return self._consultar(command, raw_text)
+
+    def _abrir_limite(self, command: str) -> bool:
+        """Revisiones agotadas: se abre la fricción en vez de la consulta."""
+        self._friccion = {"comando": command, "paso": "limite", "motivo": None}
+        self._say(messages.gmail_limite_alcanzado(command),
+                  buttons=messages.GMAIL_BOTONES_LIMITE)
+        return True
+
+    def _consultar(self, command: str, raw_text: str = "") -> bool:
+        """El acuse, la consulta y el conteo. Igual para los dos modos."""
         # Consultar el Apps Script tarda. El acuse va directo para que no
         # llegue junto con la respuesta, que es cuando ya no sirve de nada.
         if self.telegram and command != "/gmail_ayuda":
@@ -146,7 +222,8 @@ class GmailModule:
             return True
 
         # Se anota después de que la consulta salió bien: una revisión que
-        # falló no gastó nada.
+        # falló no gastó nada. Se cuenta en los dos modos: si algún día
+        # vuelve la fricción completa, el registro del día está entero.
         if hecho and command in REVISIONES:
             self._anotar_revision(command)
         return hecho
@@ -166,6 +243,20 @@ class GmailModule:
             return True
 
         if command == "/gmail_igual":
+            if self._friccion.get("paso") == "simple":
+                # Modo simple: confirmar ES revisar. Ni motivo ni modelo.
+                pedido = self._friccion["comando"]
+                self._friccion = None
+                return self._consultar(pedido)
+            if self._friccion.get("paso") == "disponible":
+                pedido = self._friccion["comando"]
+                # El cupo se vuelve a mirar al confirmar: si se gastó entre la
+                # pregunta y el sí, vuelve la fricción de siempre en vez de
+                # revisar de más.
+                if self._agotado(pedido):
+                    return self._abrir_limite(pedido)
+                self._friccion = None
+                return self._consultar(pedido)
             self._friccion["paso"] = "motivo"
             self._say(messages.GMAIL_PIDE_MOTIVO,
                       buttons=messages.GMAIL_BOTONES_MOTIVO)
@@ -210,7 +301,12 @@ class GmailModule:
             self._say(messages.GMAIL_SIN_FRICCION)
             return True
         self._friccion["motivo"] = (texto or "").strip()
-        return self._evaluar()
+        # Evaluar PRIMERO y anotar después: así el modelo compara el motivo de
+        # hoy con los anteriores, y no consigo mismo.
+        hecho = self._evaluar()
+        self._anotar_motivo(self._friccion.get("comando", ""),
+                            self._friccion.get("motivo", ""))
+        return hecho
 
     def _contexto_operativo(self) -> str:
         """Sólo lo que Mástil sabe de verdad. Sin inferir relación alguna."""
@@ -252,6 +348,7 @@ class GmailModule:
             ultima=ultima_txt,
             transcurrido=transcurrido,
             motivo=self._friccion.get("motivo", ""),
+            historial=messages.gmail_historial_motivos(self._motivos()),
             contexto=self._contexto_operativo(),
         )
 

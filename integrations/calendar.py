@@ -150,6 +150,12 @@ def read_events(ical_url: str, prefix: str = "**",
 # Puente de escritura (Apps Script)
 # ==========================================================================
 
+# La marca que Apps Script deja en la descripción de cada evento que crea
+# Mástil (ver apps_script/calendar_bridge.gs). Encuentra el evento aunque se
+# haya perdido la respuesta que traía su id.
+REQUEST_MARKER = "MASTIL_CALENDAR_REQUEST:"
+
+
 class CalendarBridge:
     def __init__(self, webapp_url: str, token: str, calendar_id: str = "primary",
                  timezone_name: str = "America/Santiago"):
@@ -229,16 +235,24 @@ class CalendarBridge:
             raise RuntimeError("El puente de Calendar no devolvio el evento creado.")
         return data
 
-    def find_event(self, event_id: str, day: str) -> dict[str, Any] | None:
+    def find_event(self, event_id: str | None, day: str,
+                   request_id: str | None = None) -> dict[str, Any] | None:
         """Relee el día y devuelve el evento si realmente está ahí.
 
         Sirve para no confiar en la palabra del puente. Que Apps Script
         conteste "ok" no prueba que el evento exista: puede haber fallado
         después de responder, haberlo creado en otro día por una diferencia
         de zona horaria, o devolver un id viejo. La única prueba es verlo.
+
+        Con `request_id` también lo reconoce por su marca: así aparece aunque
+        la respuesta con el id se haya perdido en el camino.
         """
+        marca = f"{REQUEST_MARKER}{request_id}" if request_id else None
         for evento in self.snapshot_day(day):
-            if str(evento.get("id") or "") == str(event_id):
+            if event_id and str(evento.get("id") or "") == str(event_id):
+                return evento
+            # Palabra exacta: la marca de `…:12` no puede calzar con `…:123`.
+            if marca and marca in str(evento.get("description") or "").split():
                 return evento
         return None
 

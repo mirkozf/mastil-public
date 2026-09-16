@@ -145,6 +145,28 @@ CREATE TABLE IF NOT EXISTS lite_settings (
 );
 
 
+-- ------------------------------------------------ preguntas cerradas asistidas
+-- Una pregunta enviada conserva exactamente dos opciones. El callback sólo
+-- lleva el id y a/b; el texto y la primera respuesta definitiva viven aquí.
+
+CREATE TABLE IF NOT EXISTS assisted_questions (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    creator_chat_id     TEXT NOT NULL,
+    assisted_chat_id      TEXT NOT NULL,
+    telegram_message_id INTEGER,
+    question_text       TEXT NOT NULL,
+    option_a            TEXT NOT NULL,
+    option_b            TEXT NOT NULL,
+    answered_option     TEXT CHECK(answered_option IN ('a', 'b')),
+    answered_at         TEXT,
+    created_at          TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_assisted_questions_message
+ON assisted_questions(assisted_chat_id, telegram_message_id)
+WHERE telegram_message_id IS NOT NULL;
+
+
 -- ------------------------------------------------------------------ vigía
 -- Eventos ++ . Una sesión activa a la vez, igual que el legacy. id = 1.
 -- Las fotos NO van en la base: quedan en data/evidence/vigia/ y aquí sólo
@@ -265,13 +287,15 @@ CREATE TABLE IF NOT EXISTS gmail_session (
 CREATE TABLE IF NOT EXISTS outbox (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id      TEXT NOT NULL,
-    kind         TEXT NOT NULL DEFAULT 'text',   -- text|photo|edit
+    kind         TEXT NOT NULL DEFAULT 'text',   -- text|photo|edit|delete
     text         TEXT,
     buttons      TEXT,                           -- JSON: [[label, command], ...]
     message_id   INTEGER,                        -- solo kind='edit': qué mensaje reemplazar
     photo_path   TEXT,
     parse_mode   TEXT,
     delete_photo INTEGER NOT NULL DEFAULT 0,     -- borrar el archivo tras enviar
+    retain_message INTEGER NOT NULL DEFAULT 0,   -- fuera de la retención visual normal
+    flow_key     TEXT,                            -- módulo:id; agrupa un flujo temporal
     send_after   TEXT,
     created_at   TEXT NOT NULL,
     sent_at      TEXT,
@@ -282,11 +306,30 @@ CREATE TABLE IF NOT EXISTS outbox (
 CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(sent_at, send_after);
 
 
+-- ------------------------------------------------------ orden de Telegram
+-- Solo identificadores tecnicos del chat propietario. No se guarda texto.
+-- Permite conservar tres mensajes recientes y un unico panel al final.
+
+CREATE TABLE IF NOT EXISTS telegram_messages (
+    chat_id      TEXT NOT NULL,
+    message_id   INTEGER NOT NULL,
+    direction    TEXT NOT NULL,               -- incoming|outgoing
+    kind         TEXT NOT NULL,               -- message|text|photo|document
+    is_panel     INTEGER NOT NULL DEFAULT 0,
+    protected    INTEGER NOT NULL DEFAULT 0,  -- pantalla activa de un flujo
+    flow_key     TEXT,                        -- módulo:id del flujo temporal
+    seen_at      TEXT NOT NULL,
+    deleted_at   TEXT,
+    PRIMARY KEY (chat_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_messages_visible
+ON telegram_messages(chat_id, is_panel, protected, deleted_at, message_id DESC);
 
 
 -- ------------------------------------------------------------- intervalos
--- Cronómetro de vueltas, como el del teléfono. Cada marca guarda una hora y
--- nada más.
+-- Cronómetro de vueltas, como el del teléfono. Cada marca guarda una hora y,
+-- opcionalmente, un contexto voluntario que no participa en ningún cálculo.
 --
 -- Deliberadamente sin opinión: no calcula rachas, no compara con récords y no
 -- felicita ni sanciona. Sólo registra hechos. Un cronómetro que opina deja de
@@ -302,7 +345,9 @@ CREATE TABLE IF NOT EXISTS interval_marks (
     local_day      TEXT NOT NULL,   -- YYYY-MM-DD en la zona local
     request_id     TEXT NOT NULL UNIQUE,  -- evita duplicar por reintento
     alerts_sent    INTEGER NOT NULL DEFAULT 0,  -- avisos ya emitidos
-    alert_ack      INTEGER NOT NULL DEFAULT 0   -- se apretó "ok"
+    alert_ack      INTEGER NOT NULL DEFAULT 0,  -- se apretó "ok"
+    context_category TEXT,                -- etiqueta voluntaria y neutral
+    context_text     TEXT                 -- sólo para "OTRO"
 );
 
 CREATE INDEX IF NOT EXISTS idx_interval_marks_user_day

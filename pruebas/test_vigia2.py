@@ -4,7 +4,7 @@ import os, sys, dataclasses, json
 from pathlib import Path
 from datetime import datetime, timedelta
 
-RAIZ = str(Path(__file__).resolve().parent.parent)
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, RAIZ)
 os.environ.update(MASTIL_TELEGRAM_BOT_TOKEN="0:t", MASTIL_OWNER_CHAT_ID="999",
                   MASTIL_ICAL_URL="https://x.invalid/a.ics")
@@ -67,6 +67,9 @@ class TG:
 
 class Nada:
     enabled = False
+    # Desde `ff1f2cb` el router lo llama en cada mensaje: un doble de
+    # Intervalos tiene que saber contestarlo.
+    def abandon_contexto(self, *a, **k): pass
     def handle_command(self, *a, **k): return False
     def stop(self, *a, **k): pass
     def restore_calendar(self, *a, **k): pass
@@ -250,7 +253,7 @@ r.process(msg("/vigia ordenar pieza")); out()
 r.process(msg("/vigia otra cosa"))
 ok(any(messages.VIGIA_YA_ACTIVA in x for x in textos()), "no permite dos objetivos")
 r.process(msg("/vigia_cancelar"))
-ok(any(messages.VIGIA_CANCELADO in x for x in textos()), "/vigia_cancelar CIERRA (antes era codigo muerto)")
+ok(not textos(), "/vigia_cancelar cierra sin dejar mensaje histórico")
 ok(fila()["active"] == 0, "y la sesion queda cerrada")
 r.process(msg("/vigia_stop"))
 ok(any(messages.VIGIA_SIN_OBJETIVO in x for x in textos()), "/vigia_stop sin sesion avisa")
@@ -274,7 +277,9 @@ ok(G.RAFAGA_MENSAJES == 7 and G.ESPERA_NIVEL_1 == (3, 7), "Guardian sin cambios"
 ok(G.FASES_CON_DESTINO == ("done", "discarded", "queued", "decision"), "Cola sin cambios")
 ok(G.DECISION_CADENCIA == (3, 8, 15, 30, 45, 60), "y su cadencia")
 from modules.intervalos import MOMENTOS_AVISO, ESPERA_MINUTOS
-ok(MOMENTOS_AVISO == (0, 150, 180, 420) and ESPERA_MINUTOS == 76, "Intervalos sin cambios")
+ok(MOMENTOS_AVISO == (0, 150, 180, 420), "Intervalos sin cambios")
+ok(isinstance(ESPERA_MINUTOS, int) and ESPERA_MINUTOS > 0,
+   f"ESPERA_MINUTOS lo fija el usuario a mano: {ESPERA_MINUTOS} min")
 ok(messages.INTERVALOS_AVISO == "⏱ Intervalo cumplido.", "y su aviso")
 
 print("\n=== ya no ofusca el calendario ===")

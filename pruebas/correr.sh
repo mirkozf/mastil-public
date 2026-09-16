@@ -1,5 +1,5 @@
 #!/bin/bash
-# Corre las 16 suites de Mástil. Desde Git Bash:
+# Corre las 37 suites de Mástil. Desde Git Bash:
 #     bash pruebas/correr.sh
 #
 # Son deterministas: reloj falso, Telegram y Gemini dobles, base temporal que

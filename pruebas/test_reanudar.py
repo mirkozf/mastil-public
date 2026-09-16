@@ -1,6 +1,6 @@
 import os, sys, dataclasses, json
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.update(MASTIL_TELEGRAM_BOT_TOKEN="0:t", MASTIL_OWNER_CHAT_ID="999",
                   MASTIL_ICAL_URL="https://x.invalid/a.ics")
 import config as cm, messages
@@ -66,7 +66,8 @@ r.process(msg("/vigia ordenar la cocina",1)); out()
 r.process(cb("/vigia_bloque")); f=out()[-1]
 ok("ordenar la cocina" in (f["text"] or ""), "muestra el objetivo")
 ok(messages.VIGIA_SIN_BLOQUE in (f["text"] or ""), "y dice que aun no hay bloque")
-ok(btns(f)==["panel:vig:ctx","panel:home"], f"salidas ({btns(f)})")
+ok(btns(f)==["panel:vig:ctx","panel:vig:foto:2","panel:home"],
+   f"salidas, con la opcion de dos fotos ({btns(f)})")
 
 print("\n=== con bloque en curso ===")
 vis.r.append(PLAN); r.process(foto(2,"a")); out()

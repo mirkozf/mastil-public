@@ -1,194 +1,173 @@
-"""/tiempo: primera libre, las demas con una decision delante. Sin prohibicion."""
-import os, sys, dataclasses, json
+"""/tiempo: consulta directa desde la última marca."""
+import dataclasses
+import json
+import os
+import sys
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-os.environ.update(MASTIL_TELEGRAM_BOT_TOKEN="0:t", MASTIL_OWNER_CHAT_ID="999",
-                  MASTIL_ICAL_URL="https://x.invalid/a.ics", MASTIL_TIMEZONE="UTC")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ.update(
+    MASTIL_TELEGRAM_BOT_TOKEN="0:t",
+    MASTIL_OWNER_CHAT_ID="999",
+    MASTIL_ICAL_URL="https://x.invalid/a.ics",
+    MASTIL_TIMEZONE="UTC",
+)
 
-import config as cm, messages
+import config as cm
+import messages
 import modules.intervalos as I
-from database import Database
 from core.router import Router
-from modules.intervalos import IntervalosModule, TIEMPO_USADO_KEY
+from database import Database
+from modules.intervalos import (
+    ESPERA_MINUTOS,
+    HORAS_CIERRE,
+    MAX_FILAS,
+    MOMENTOS_AVISO,
+    IntervalosModule,
+    formato_duracion,
+)
 
-# Este Python de Windows no trae tzdata; Intervalos usa ZoneInfo solo para el
-# dia local de la marca.
-I.ZoneInfo = lambda nombre: timezone.utc
+I.ZoneInfo = lambda _: timezone.utc
 
 YO = "999"
-TMP = Path(os.environ["TEMP"]) / "tfric.db"
+TMP = Path(os.environ["TEMP"]) / "tiempo_directo.db"
 cfg = dataclasses.replace(cm.load(), owner_chat_id=YO, db_path=TMP)
-
 FALLAS = 0
-def ok(c, t):
+
+
+def ok(condicion, texto):
     global FALLAS
-    print(f"  {'ok  ' if c else 'MAL '} {t}")
-    if not c: FALLAS += 1
+    print(f"  {'ok  ' if condicion else 'MAL '} {texto}")
+    if not condicion:
+        FALLAS += 1
+
 
 class TG:
-    def answer_callback(s, *a, **k): pass
-    def send_message(s, *a, **k): return {"ok": True}
+    def answer_callback(self, *args, **kwargs):
+        pass
+
+    def send_message(self, *args, **kwargs):
+        return {"ok": True}
+
+
 class Nada:
     enabled = False
-    def __getattr__(s, n): return lambda *a, **k: False
+
+    def __getattr__(self, _name):
+        return lambda *args, **kwargs: False
+
 
 db = None
+
+
 def montar():
-    global db, inter, r
-    if db: db.close()
+    global db, inter, router
+    if db:
+        db.close()
     TMP.unlink(missing_ok=True)
-    db = Database(cfg.db_path, cfg.schema_path); db.migrate()
+    db = Database(cfg.db_path, cfg.schema_path)
+    db.migrate()
     inter = IntervalosModule(cfg, db)
-    mods = {"intervalos": inter}
-    for k in ("panel","vigia","timer","system","pomodoro","gmail",
-              "guardian","calendar","lite"):
-        mods[k] = Nada()
-    r = Router(cfg, db, TG(), mods)
-    return inter, r
+    modules = {"intervalos": inter}
+    for nombre in ("panel", "vigia", "timer", "system", "pomodoro",
+                   "gmail", "guardian", "calendar", "lite"):
+        modules[nombre] = Nada()
+    router = Router(cfg, db, TG(), modules)
 
-def out():
-    f = db.query("SELECT * FROM outbox WHERE sent_at IS NULL ORDER BY id")
-    db.execute("UPDATE outbox SET sent_at='x' WHERE sent_at IS NULL"); return f
+
+def salida():
+    filas = db.query("SELECT * FROM outbox WHERE sent_at IS NULL ORDER BY id")
+    db.execute("UPDATE outbox SET sent_at='x' WHERE sent_at IS NULL")
+    return filas
+
+
 def ultimo():
-    f = out()
-    return f[-1] if f else None
-def btns(f): return [b[1] for g in json.loads(f["buttons"]) for b in g] if f and f["buttons"] else []
-def etiq(f): return [b[0] for g in json.loads(f["buttons"]) for b in g] if f and f["buttons"] else []
-
-def marcar(n): inter.handle("/marca", f"src-{n}"); out()
-def tiempo(): inter.handle("/tiempo", None); return ultimo()
-def mostrar(): inter.handle("/tiempo_mostrar", None); return ultimo()
-def dejarlo(): inter.handle("/tiempo_dejarlo", None); return ultimo()
-
-def es_tiempo(f):
-    """El mensaje con el tiempo real, no la friccion."""
-    t = (f["text"] or "") if f else ""
-    return "marca" in t.lower() and messages.INTERVALOS_TIEMPO_FRICCION not in t
-def es_friccion(f):
-    return messages.INTERVALOS_TIEMPO_FRICCION in ((f["text"] or "") if f else "")
+    filas = salida()
+    return filas[-1] if filas else None
 
 
-print("=== 1. primera consulta: directa ===")
-montar(); marcar(1)
-f = tiempo()
-ok(es_tiempo(f), "muestra el tiempo")
-ok(not es_friccion(f), "sin friccion")
+def es_tiempo(fila):
+    return bool(fila) and "marca" in (fila["text"] or "").lower()
 
-print("\n=== 2/3. segunda: friccion, NO el tiempo ===")
-f = tiempo()
-ok(es_friccion(f), "aparece la friccion")
-ok(not es_tiempo(f), "y NO muestra el tiempo")
-ok(btns(f) == ["/tiempo_mostrar", "/tiempo_dejarlo"], f"dos botones ({btns(f)})")
-ok(etiq(f) == ["✅ MOSTRAR", "↩️ DEJARLO"], f"con esas etiquetas ({etiq(f)})")
 
-print("\n=== 4. DEJARLO cierra sin mostrar ===")
-estado_antes = db.get_state(TIEMPO_USADO_KEY)
-f = dejarlo()
-ok(messages.INTERVALOS_TIEMPO_DEJADO in (f["text"] or ""), "responde y cierra")
-ok(not es_tiempo(f), "sin mostrar el tiempo")
-ok(db.get_state(TIEMPO_USADO_KEY) == estado_antes, "y no cambia ningun estado")
+def tiene_friccion(fila):
+    if not fila or not fila["buttons"]:
+        return False
+    botones = json.dumps(json.loads(fila["buttons"]))
+    return "/tiempo_mostrar" in botones or "/tiempo_dejarlo" in botones
 
-print("\n=== 5. MOSTRAR si muestra ===")
-f = mostrar()
-ok(es_tiempo(f), "muestra el tiempo")
 
-print("\n=== 6/7/8. la friccion vuelve, indefinidamente ===")
-for vuelta in range(1, 5):
-    f = tiempo()
-    ok(es_friccion(f), f"consulta extra {vuelta}: friccion otra vez")
-    f = mostrar()
-    ok(es_tiempo(f), f"  y MOSTRAR funciona la vez {vuelta}")
+def marcar(numero):
+    inter.handle("/marca", f"marca-{numero}")
+    salida()
 
-print("\n=== la secuencia que pediste: /tiempo x4 ===")
-montar(); marcar(1)
-resultados = []
-for _ in range(4):
-    resultados.append("tiempo" if es_tiempo(tiempo()) else "friccion")
-ok(resultados == ["tiempo", "friccion", "friccion", "friccion"],
-   f"solo la primera es directa ({resultados})")
-seguidas = ["tiempo" if es_tiempo(mostrar()) else "no" for _ in range(3)]
-ok(seguidas == ["tiempo"] * 3, f"y MOSTRAR funciona las 3 veces ({seguidas})")
 
-print("\n=== no hay tope: 15 veces seguidas ===")
-for _ in range(15):
-    tiempo(); mostrar()
-ok(es_tiempo(mostrar()), "a la 15 sigue funcionando")
-ok(es_friccion(tiempo()), "y la friccion sigue apareciendo")
+def tiempo():
+    inter.handle("/tiempo", None)
+    return ultimo()
 
-print("\n=== 9. una marca nueva devuelve la consulta libre ===")
+
+print("=== primera consulta ===")
+montar()
+marcar(1)
+fila = tiempo()
+ok(es_tiempo(fila), "muestra el tiempo")
+ok(not tiene_friccion(fila), "sin decisiones intermedias")
+
+print("\n=== consultas repetidas ===")
+for numero in range(1, 21):
+    fila = tiempo()
+    ok(es_tiempo(fila), f"consulta {numero}: tiempo directo")
+    ok(not tiene_friccion(fila), f"consulta {numero}: sin friccion")
+
+print("\n=== marca nueva y reinicio del modulo ===")
 marcar(2)
-f = tiempo()
-ok(es_tiempo(f), "primera del intervalo nuevo: directa")
-ok(es_friccion(tiempo()), "y la segunda vuelve a la friccion")
-
-print("\n=== 10. el estado sobrevive el reinicio ===")
-usado = db.get_state(TIEMPO_USADO_KEY)
-inter2 = IntervalosModule(cfg, db)
-inter2.handle("/tiempo", None)
-ok(es_friccion(ultimo()), "reiniciar NO devuelve la consulta libre")
-ok(db.get_state(TIEMPO_USADO_KEY) == usado, "el estado es el mismo")
-inter2.handle("/tiempo_mostrar", None)
-ok(es_tiempo(ultimo()), "y MOSTRAR sigue andando tras reiniciar")
+ok(es_tiempo(tiempo()), "la marca nueva responde directo")
+inter_reiniciado = IntervalosModule(cfg, db)
+inter_reiniciado.handle("/tiempo", None)
+ok(es_tiempo(ultimo()), "sigue directo tras reiniciar el modulo")
 
 print("\n=== sin marcas ===")
 montar()
-f = tiempo()
-ok(messages.INTERVALOS_SIN_MARCAS in (f["text"] or ""), "dice que no hay marcas")
-ok(db.get_state(TIEMPO_USADO_KEY) is None, "y no gasta la consulta libre")
-f = mostrar()
-ok(messages.INTERVALOS_SIN_MARCAS in (f["text"] or ""), "MOSTRAR sin marcas tambien avisa")
+fila = tiempo()
+ok(messages.INTERVALOS_SIN_MARCAS in (fila["text"] or ""), "explica que faltan marcas")
 
-print("\n=== por el router, como los botones reales ===")
-montar(); marcar(1)
-def cb(d): return {"callback_query": {"id": "c", "data": d, "from": {"id": YO},
-                                      "message": {"message_id": 7, "chat": {"id": YO}}}}
-r.process({"message": {"message_id": 1, "chat": {"id": YO}, "from": {"id": YO}, "text": "/tiempo"}})
-out()
-r.process({"message": {"message_id": 2, "chat": {"id": YO}, "from": {"id": YO}, "text": "/tiempo"}})
-ok(es_friccion(ultimo()), "el router entrega la friccion")
-r.process(cb("/tiempo_mostrar"))
-ok(es_tiempo(ultimo()), "y el boton MOSTRAR llega a Intervalos")
-r.process(cb("/tiempo_dejarlo"))
-ok(messages.INTERVALOS_TIEMPO_DEJADO in (ultimo()["text"] or ""), "y DEJARLO tambien")
+print("\n=== router ===")
+montar()
+marcar(1)
+router.process({
+    "message": {"message_id": 1, "chat": {"id": YO}, "from": {"id": YO},
+                "text": "/tiempo"}
+})
+ok(es_tiempo(ultimo()), "el router entrega el tiempo")
+router.process({
+    "message": {"message_id": 2, "chat": {"id": YO}, "from": {"id": YO},
+                "text": "/tiempo"}
+})
+ok(es_tiempo(ultimo()), "el router repite el tiempo directo")
 
-print("\n=== 11/12/13/14. nada mas cambio ===")
-from modules.intervalos import (MOMENTOS_AVISO, ESPERA_MINUTOS, HORAS_CIERRE,
-                                MAX_FILAS, formato_duracion)
+print("\n=== el resto del modulo ===")
 ok(MOMENTOS_AVISO == (0, 150, 180, 420), f"avisos intactos {MOMENTOS_AVISO}")
-ok(ESPERA_MINUTOS == 76 and HORAS_CIERRE == 4 and MAX_FILAS == 10, "constantes intactas")
+ok(HORAS_CIERRE == 4 and MAX_FILAS == 10, "constantes intactas")
+ok(isinstance(ESPERA_MINUTOS, int) and ESPERA_MINUTOS > 0,
+   f"ESPERA_MINUTOS sigue en {ESPERA_MINUTOS} min")
 ok(formato_duracion(3661) == "1h 01m 01s" and formato_duracion(0) == "00m 00s",
    "el calculo no cambia")
-ok(messages.INTERVALOS_AVISO == "⏱ Intervalo cumplido.", "el aviso intacto")
 
-montar()
-inter.handle("/marca", "a"); t1 = out()
-ok(any("TRAMO" in (x["text"] or "") for x in t1), "/marca devuelve su tabla igual")
-inter.handle("/marca", "a")
-ok(len(db.query("SELECT * FROM interval_marks")) == 1, "idempotencia de /marca intacta")
-out()
-inter.handle("/reset", None)
-ok(any("Ciclo cerrado" in (x["text"] or "") for x in out()), "/reset igual")
-
-from modules import reporte
-filas, total = reporte.tabla_del_dia([datetime.now(timezone.utc),
-                                      datetime.now(timezone.utc) + timedelta(minutes=5)])
-ok(filas[0][1] == "Inicio" and total == "05m 00s", "el reporte no cambia")
-
-# El aviso del intervalo es de `tick()` y no tiene nada que ver con /tiempo.
 montar()
 db.execute(
     "INSERT INTO interval_marks(user_id, marked_at_utc, local_day, request_id) "
     "VALUES (?,?,?,?)",
-    (YO, (datetime.now(timezone.utc) - timedelta(minutes=80)).isoformat(),
+    (YO, (datetime.now(timezone.utc) - timedelta(minutes=ESPERA_MINUTOS + 5)).isoformat(),
      "2026-08-19", "viejo"),
 )
 inter.tick()
-ok(any(messages.INTERVALOS_AVISO in (x["text"] or "") for x in out()),
-   "el aviso de los 76 min sigue saliendo")
-ok(es_tiempo(tiempo()), "y no consumio la consulta libre del intervalo")
+ok(any(messages.INTERVALOS_AVISO in (fila["text"] or "") for fila in salida()),
+   "el aviso del intervalo sigue saliendo")
+ok(es_tiempo(tiempo()), "y /tiempo sigue directo")
 
-db.close(); TMP.unlink(missing_ok=True)
+db.close()
+TMP.unlink(missing_ok=True)
 print("\nFALLAS:", FALLAS)
 sys.exit(1 if FALLAS else 0)

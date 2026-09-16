@@ -5,9 +5,14 @@ propietario puede saber que **hubo** un recordatorio, que se creó o que no se
 confirmó. Nunca su texto. Por eso `activity_enc` va cifrado en la base y sólo
 se descifra para mostrárselo a ella.
 
-La experiencia es deliberadamente rígida: dos formatos de entrada, un número de
-cuatro dígitos en una imagen grande para apagar la alarma, y nada más. Sin
-comandos con `/`, sin botones, sin menús.
+La experiencia es deliberadamente rígida: se entra escribiendo «recordar» y se
+sale por la misma palabra, con un número de cuatro dígitos en una imagen grande
+para apagar la alarma. Sin comandos con `/`, sin botones, sin menús.
+
+Hay dos caminos para crear, y conviven: la sintaxis completa de una sola línea
+(`recordar hoy 21:30 bañarme`), y un borrador guiado que pregunta de a una cosa
+por vez cuando esa sintaxis no sale. Componer la línea entera de memoria es
+justamente lo caro; el borrador paga ese costo.
 
 El cifrado es el mismo del legacy, byte por byte: los recordatorios que ya
 existen se siguen leyendo sin recifrar nada.
@@ -17,11 +22,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import random
 import re
 import unicodedata
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import messages
@@ -33,6 +39,24 @@ MESES = {
     "octubre": 10, "noviembre": 11, "diciembre": 12,
 }
 NOMBRE_MES = {v: k for k, v in MESES.items() if k != "setiembre"}
+
+# Pasos del borrador guiado.
+PASO_ACTIVIDAD = "actividad"
+PASO_DIA = "dia"
+PASO_HORA = "hora"
+PASO_FRANJA = "franja"
+PASO_CONFIRMAR = "confirmar"
+
+# Un borrador a medias no se guarda para siempre: vence solo y en silencio.
+# No insiste ni vuelve a preguntar — Lite no es Guardian.
+BORRADOR_MINUTOS = 15
+
+# Respuestas libres. Van sin tildes porque se comparan contra `_norm`.
+CANCELAR = {"nada", "cancelar", "dejalo", "dejarlo", "chao", "olvidalo",
+            "no importa", "salir", "ninguno", "ninguna"}
+SI = {"si", "ya", "listo", "correcto", "esta bien", "ok", "dale", "bueno",
+      "asi es", "confirmo", "claro"}
+NO = {"no", "esta mal", "cambiar", "otra vez", "mal"}
 
 
 def _norm(text: str) -> str:
@@ -175,7 +199,10 @@ class LiteModule:
             )
             return fila is not None
 
-        return False
+        # Un borrador abierto reclama cualquier respuesta suya: está
+        # contestando una pregunta, no escribiendo un comando. Mismo criterio
+        # que arriba — se resuelve por hecho, no por adivinanza.
+        return self._borrador_leer(chat_id) is not None
 
     def handle_message(self, chat_id: str, text: str) -> bool:
         user = self.config.lite_user(chat_id)
@@ -183,6 +210,16 @@ class LiteModule:
             return False
 
         limpio = _norm(text)
+
+        # Una alarma sonando manda sobre todo lo demás: apagarla es lo urgente.
+        # Además su código son 4 dígitos, que en mitad de un borrador podrían
+        # confundirse con una hora, así que el desempate va primero y por hecho.
+        if re.match(r"^\d{4}$", limpio) and self._alarma_sonando(chat_id):
+            return self._confirm(user, limpio)
+
+        borrador = self._borrador_leer(chat_id)
+        if borrador is not None:
+            return self._borrador_paso(user, borrador, text, limpio)
 
         if limpio in ("/start", "start", "hola", "hola soy yo"):
             with self.db.transaction():
@@ -206,31 +243,318 @@ class LiteModule:
     def _create(self, user, text: str) -> bool:
         parsed = self.parse(text, user.timezone)
         if not parsed:
-            with self.db.transaction():
-                self._to_user(user.chat_id, messages.LITE_AYUDA)
-                self._to_owner(messages.lite_aviso_invalido(user.name))
-            return True
+            # La línea completa no salió. Devolverle el formato sería devolverle
+            # justo lo caro: componer la frase entera de memoria. Se abre el
+            # borrador y se le pregunta de a una cosa.
+            return self._borrador_abrir(user, text)
 
         cuando, fecha, hora, actividad = parsed
         with self.db.transaction():
-            self.db.execute(
-                """
-                INSERT INTO lite_reminders
-                    (user_chat_id, user_name, remind_at_utc, display_date,
-                     display_time, activity_enc, status, created_at_utc)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
-                """,
-                (
-                    user.chat_id, user.name,
-                    cuando.astimezone(timezone.utc).isoformat(),
-                    fecha, hora, self.encrypt(actividad),
-                    datetime.now(timezone.utc).isoformat(),
-                ),
-            )
-            self._to_user(user.chat_id, messages.lite_creado(fecha, hora, actividad))
-            self._to_owner(messages.lite_aviso_creado(user.name))
-            self.db.audit("lite", "create")
+            self._guardar(user, cuando, fecha, hora, actividad)
         return True
+
+    def _guardar(self, user, cuando, fecha: str, hora: str, actividad: str,
+                 cierre: str = "") -> None:
+        """Inserta el recordatorio y avisa. Va DENTRO de una transacción.
+
+        Los dos caminos de creación —la línea completa y el borrador guiado—
+        terminan acá, así que el cifrado y el aviso al propietario no pueden
+        quedar distintos según por dónde se entró.
+        """
+        self.db.execute(
+            """
+            INSERT INTO lite_reminders
+                (user_chat_id, user_name, remind_at_utc, display_date,
+                 display_time, activity_enc, status, created_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (
+                user.chat_id, user.name,
+                cuando.astimezone(timezone.utc).isoformat(),
+                fecha, hora, self.encrypt(actividad),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        self._to_user(user.chat_id,
+                      messages.lite_creado(fecha, hora, actividad) + cierre)
+        self._to_owner(messages.lite_aviso_creado(user.name))
+        self.db.audit("lite", "create")
+
+    # ------------------------------------------------------------- borrador
+    #
+    # El borrador vive en `system_state`, no en una tabla nueva: es una fila por
+    # usuaria y se borra al terminar.
+    #
+    # Va CIFRADO con la misma llave de los recordatorios. Contiene el texto que
+    # ella escribió antes de que exista la fila definitiva, así que dejarlo en
+    # claro filtraría exactamente lo que este módulo existe para proteger.
+
+    def _borrador_key(self, chat_id: str) -> str:
+        return f"lite_borrador:{chat_id}"
+
+    def _borrador_leer(self, chat_id: str):
+        crudo = self.db.get_state(self._borrador_key(chat_id))
+        if not crudo:
+            return None
+        try:
+            datos = json.loads(self.decrypt(crudo))
+            nacido = datetime.fromisoformat(datos["creado"])
+        except Exception:
+            self._borrador_descartar(chat_id)
+            return None
+
+        vencido = (datetime.now(timezone.utc) - nacido).total_seconds()
+        if vencido > BORRADOR_MINUTOS * 60:
+            self._borrador_descartar(chat_id)
+            return None
+        return datos
+
+    def _borrador_descartar(self, chat_id: str) -> None:
+        """Limpieza perezosa, fuera de transacción: nadie recibe un mensaje."""
+        with self.db.transaction():
+            self._borrador_borrar(chat_id)
+
+    def _borrador_borrar(self, chat_id: str) -> None:
+        self.db.execute("DELETE FROM system_state WHERE key = ?",
+                        (self._borrador_key(chat_id),))
+
+    def _borrador_guardar(self, chat_id: str, datos: dict) -> None:
+        self.db.set_state(
+            self._borrador_key(chat_id),
+            self.encrypt(json.dumps(datos, ensure_ascii=False)),
+        )
+
+    def _alarma_sonando(self, chat_id: str) -> bool:
+        fila = self.db.one(
+            "SELECT id FROM lite_reminders WHERE user_chat_id = ? AND status = 'alerting' LIMIT 1",
+            (str(chat_id),),
+        )
+        return fila is not None
+
+    def _borrador_abrir(self, user, text: str) -> bool:
+        resto = re.sub(r"^\s*recordar\s*", "", text, flags=re.I).strip()
+
+        # El resto sólo se toma como actividad si no arranca con algo que
+        # parezca fecha u hora: `recordar hoy 25:00 x` es un intento fallido de
+        # la sintaxis vieja, no una tarea que se llama «hoy 25:00 x».
+        primera = _norm(resto).split(" ")[0] if resto else ""
+        parece_fecha = (not resto) or primera in ("hoy", "manana") or primera.isdigit()
+        actividad = "" if parece_fecha else resto
+
+        datos = {
+            "paso": PASO_DIA if actividad else PASO_ACTIVIDAD,
+            "actividad": actividad,
+            "creado": datetime.now(timezone.utc).isoformat(),
+        }
+        with self.db.transaction():
+            self._borrador_guardar(user.chat_id, datos)
+            self._to_user(
+                user.chat_id,
+                messages.LITE_GUIA_DIA if actividad else messages.LITE_GUIA_ACTIVIDAD,
+            )
+        return True
+
+    def _borrador_paso(self, user, datos: dict, text: str, limpio: str) -> bool:
+        if limpio in CANCELAR:
+            with self.db.transaction():
+                self._borrador_borrar(user.chat_id)
+                self._to_user(user.chat_id, messages.LITE_GUIA_CANCELADO)
+            return True
+
+        paso = datos.get("paso")
+
+        if paso == PASO_ACTIVIDAD:
+            actividad = text.strip()
+            if not actividad:
+                with self.db.transaction():
+                    self._to_user(user.chat_id, messages.LITE_GUIA_ACTIVIDAD)
+                return True
+            datos["actividad"] = actividad
+            datos["paso"] = PASO_DIA
+            with self.db.transaction():
+                self._borrador_guardar(user.chat_id, datos)
+                self._to_user(user.chat_id, messages.LITE_GUIA_DIA)
+            return True
+
+        if paso == PASO_DIA:
+            dia = self._parse_dia(limpio, user.timezone)
+            if not dia:
+                with self.db.transaction():
+                    self._to_user(user.chat_id, messages.LITE_GUIA_DIA_OTRA_VEZ)
+                return True
+            datos["dia"], datos["fecha"] = dia
+            datos["paso"] = PASO_HORA
+            with self.db.transaction():
+                self._borrador_guardar(user.chat_id, datos)
+                self._to_user(user.chat_id, messages.LITE_GUIA_HORA)
+            return True
+
+        if paso == PASO_HORA:
+            # Si la hora de hoy ya pasó, «mañana» corre el día sin obligarla a
+            # empezar todo de nuevo.
+            if limpio == "manana":
+                return self._borrador_mover_manana(user, datos)
+
+            hora = self._parse_hora(limpio)
+            if not hora:
+                with self.db.transaction():
+                    self._to_user(user.chat_id, messages.LITE_GUIA_HORA_OTRA_VEZ)
+                return True
+
+            hh, mm, ambiguo = hora
+            if ambiguo:
+                datos["hh"], datos["mm"] = hh, mm
+                datos["paso"] = PASO_FRANJA
+                with self.db.transaction():
+                    self._borrador_guardar(user.chat_id, datos)
+                    self._to_user(user.chat_id, messages.LITE_GUIA_FRANJA)
+                return True
+            return self._borrador_hora_lista(user, datos, hh, mm)
+
+        if paso == PASO_FRANJA:
+            franja = self._parse_franja(limpio)
+            if franja is None:
+                with self.db.transaction():
+                    self._to_user(user.chat_id, messages.LITE_GUIA_FRANJA)
+                return True
+            hh = int(datos.get("hh", 0)) % 12
+            if franja == "pm":
+                hh += 12
+            return self._borrador_hora_lista(user, datos, hh, int(datos.get("mm", 0)))
+
+        if paso == PASO_CONFIRMAR:
+            if limpio in SI:
+                return self._borrador_cerrar(user, datos)
+            if limpio in NO:
+                with self.db.transaction():
+                    self._borrador_borrar(user.chat_id)
+                    self._to_user(user.chat_id, messages.LITE_GUIA_CANCELADO)
+                return True
+            with self.db.transaction():
+                self._to_user(user.chat_id, messages.LITE_GUIA_CONFIRMA_OTRA_VEZ)
+            return True
+
+        # Paso desconocido: nunca dejarla atrapada en un borrador sin salida.
+        with self.db.transaction():
+            self._borrador_borrar(user.chat_id)
+            self._to_user(user.chat_id, messages.LITE_AYUDA)
+        return True
+
+    def _borrador_mover_manana(self, user, datos: dict) -> bool:
+        manana = (datetime.now(ZoneInfo(user.timezone)) + timedelta(days=1)).date()
+        datos["dia"] = manana.isoformat()
+        datos["fecha"] = "mañana"
+        datos["paso"] = PASO_HORA
+        with self.db.transaction():
+            self._borrador_guardar(user.chat_id, datos)
+            self._to_user(user.chat_id, messages.LITE_GUIA_MANANA)
+        return True
+
+    def _borrador_hora_lista(self, user, datos: dict, hh: int, mm: int) -> bool:
+        cuando = self._componer(datos, hh, mm, user.timezone)
+        if cuando <= datetime.now(ZoneInfo(user.timezone)):
+            datos["paso"] = PASO_HORA
+            with self.db.transaction():
+                self._borrador_guardar(user.chat_id, datos)
+                self._to_user(user.chat_id, messages.LITE_GUIA_HORA_PASADA)
+            return True
+
+        datos["hora"] = f"{hh:02d}:{mm:02d}"
+        datos["paso"] = PASO_CONFIRMAR
+        with self.db.transaction():
+            self._borrador_guardar(user.chat_id, datos)
+            self._to_user(user.chat_id, messages.lite_guia_confirmar(
+                datos["fecha"], datos["hora"], datos["actividad"]))
+        return True
+
+    def _borrador_cerrar(self, user, datos: dict) -> bool:
+        hh, mm = (int(parte) for parte in datos["hora"].split(":"))
+        cuando = self._componer(datos, hh, mm, user.timezone)
+
+        # Se revalida al confirmar: entre la pregunta y el «sí» pudo pasar la
+        # hora, y un recordatorio que nace vencido no avisa nunca.
+        if cuando <= datetime.now(ZoneInfo(user.timezone)):
+            datos["paso"] = PASO_HORA
+            with self.db.transaction():
+                self._borrador_guardar(user.chat_id, datos)
+                self._to_user(user.chat_id, messages.LITE_GUIA_HORA_PASADA)
+            return True
+
+        with self.db.transaction():
+            self._borrador_borrar(user.chat_id)
+            self._guardar(user, cuando, datos["fecha"], datos["hora"],
+                          datos["actividad"], cierre=messages.LITE_INVITACION)
+        return True
+
+    def _componer(self, datos: dict, hh: int, mm: int, tz: str) -> datetime:
+        dia = date.fromisoformat(datos["dia"])
+        return datetime(dia.year, dia.month, dia.day, hh, mm, tzinfo=ZoneInfo(tz))
+
+    def _parse_dia(self, limpio: str, tz: str):
+        """Devuelve (fecha ISO, etiqueta para mostrar) o None."""
+        ahora = datetime.now(ZoneInfo(tz))
+        if limpio == "hoy":
+            return ahora.date().isoformat(), "hoy"
+        if limpio == "manana":
+            return (ahora + timedelta(days=1)).date().isoformat(), "mañana"
+
+        match = re.match(r"^(\d{1,2})\s*(?:de\s+)?([a-z]+)$", limpio)
+        if not match:
+            return None
+        mes = MESES.get(match.group(2))
+        if not mes:
+            return None
+        try:
+            fecha = date(ahora.year, mes, int(match.group(1)))
+        except ValueError:
+            return None
+        if fecha < ahora.date():
+            try:
+                fecha = date(ahora.year + 1, mes, int(match.group(1)))
+            except ValueError:
+                return None
+        return fecha.isoformat(), f"{int(match.group(1))} de {NOMBRE_MES[mes]}"
+
+    def _parse_hora(self, limpio: str):
+        """Devuelve (hh, mm, ambiguo) o None.
+
+        `ambiguo` es True cuando dijo un número de 1 a 12 sin aclarar si era de
+        la mañana o de la tarde. Ahí se pregunta en vez de adivinar: un recordatorio
+        a las nueve de la noche en vez de las nueve de la mañana no es un detalle.
+        """
+        match = re.match(r"^(\d{2})(\d{2})$", limpio)
+        if match:
+            hh, mm = int(match.group(1)), int(match.group(2))
+            if hh > 23 or mm > 59:
+                return None
+            return hh, mm, 1 <= hh <= 12
+
+        match = re.match(r"^(?:a\s+las\s+)?(\d{1,2})(?:[:.\s](\d{1,2}))?\s*(.*)$", limpio)
+        if not match:
+            return None
+        hh = int(match.group(1))
+        mm = int(match.group(2) or 0)
+        if hh > 23 or mm > 59:
+            return None
+
+        franja = self._parse_franja(match.group(3) or "")
+        if franja == "am":
+            return (0 if hh == 12 else hh), mm, False
+        if franja == "pm":
+            return (hh if hh >= 12 else hh + 12), mm, False
+
+        if hh == 0 or hh >= 13:
+            return hh, mm, False
+        return hh, mm, True
+
+    def _parse_franja(self, limpio: str):
+        if not limpio:
+            return None
+        if re.search(r"\b(am|manana|madrugada)\b", limpio):
+            return "am"
+        if re.search(r"\b(pm|tarde|noche|mediodia)\b", limpio):
+            return "pm"
+        return None
 
     def _list(self, user) -> bool:
         filas = self.db.query(
